@@ -5,7 +5,7 @@
     "license": "MIT",
     "minimum-stability": "stable",
     "require": {
-        "php": "^8.2",
+        "php": "^8.3",
         "react/socket": "^1.15",
         "react/event-loop": "^1.5",
         "psr/log": "^3.0",

@@ -6,7 +6,7 @@ A pure-PHP MQTT broker supporting MQTT 3.1.1 and 5.0, built on [ReactPHP](https:
 
 ## Requirements
 
-- PHP 8.2+
+- PHP 8.3+
 - Composer
 
 ## Installation

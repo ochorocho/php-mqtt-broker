@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Tests (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: sockets, pcntl
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Run PHPStan
+        run: vendor/bin/phpstan analyse src/ --level=8
+
+      - name: Run PHPUnit
+        run: vendor/bin/phpunit
+
+  paho-conformance:
+    name: Paho MQTT Conformance
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: sockets, pcntl
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Clone Paho MQTT testing suite
+        run: git clone --depth 1 https://github.com/eclipse-paho/paho.mqtt.testing.git
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Start MQTT broker
+        run: |
+          php bin/mqtt-broker 2>broker.log &
+          echo $! > broker.pid
+          for i in $(seq 1 30); do
+            if nc -z localhost 1883 2>/dev/null; then
+              echo "Broker ready"
+              break
+            fi
+            sleep 0.5
+          done
+
+      - name: Run MQTT 3.1.1 conformance tests
+        run: cd paho.mqtt.testing/interoperability && python3 client_test.py
+
+      - name: Run MQTT 5.0 conformance tests
+        run: cd paho.mqtt.testing/interoperability && python3 client_test5.py
+
+      - name: Show broker logs on failure
+        if: failure()
+        run: cat broker.log
+
+      - name: Stop broker
+        if: always()
+        run: |
+          if [ -f broker.pid ]; then
+            kill "$(cat broker.pid)" 2>/dev/null || true
+          fi
