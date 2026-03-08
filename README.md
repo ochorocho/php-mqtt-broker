@@ -1,5 +1,7 @@
 # php-mqtt/broker
 
+:warning: This is experimental for now :warning:
+
 A pure-PHP MQTT broker supporting MQTT 3.1.1 and 5.0, built on [ReactPHP](https://reactphp.org/).
 
 ## Requirements
