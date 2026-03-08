@@ -17,6 +17,7 @@ use PhpMqtt\Broker\Server\ConnectionStream;
 use PhpMqtt\Broker\Server\ReactPhpServer;
 use PhpMqtt\Broker\Server\ServerInterface;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
+use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 
@@ -34,6 +35,7 @@ final class Broker
         private readonly ServerInterface $server = new ReactPhpServer(),
         ?AuthenticatorInterface $authenticator = null,
         private readonly LoggerInterface $logger = new NullLogger(),
+        private readonly ?EventDispatcherInterface $eventDispatcher = null,
     ) {
         $this->connectionManager = new ConnectionManager();
         $this->subscriptionManager = new SubscriptionManager();
@@ -47,6 +49,7 @@ final class Broker
             loop: $this->server->getLoop(),
             packetEncoder: $this->packetEncoder,
             logger: $this->logger,
+            eventDispatcher: $this->eventDispatcher,
         );
     }
 

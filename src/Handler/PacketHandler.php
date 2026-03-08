@@ -30,6 +30,8 @@ use PhpMqtt\Broker\Protocol\Property\PropertyId;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
 use PhpMqtt\Broker\Session\SessionManager;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
+use PhpMqtt\Broker\Event\MessagePublished;
+use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use React\EventLoop\LoopInterface;
@@ -69,6 +71,7 @@ final class PacketHandler
         private readonly LoopInterface $loop,
         private readonly PacketEncoder $packetEncoder,
         private readonly LoggerInterface $logger = new NullLogger(),
+        private readonly ?EventDispatcherInterface $eventDispatcher = null,
     ) {
         $this->retainedMessages = new RetainedMessageStore();
         $this->sessionManager = new SessionManager();
@@ -499,6 +502,9 @@ final class PacketHandler
             return; // Don't deliver yet — wait for PUBREL
         }
 
+        // Dispatch event for QoS 0 and QoS 1 messages
+        $this->dispatchMessagePublished($packet, $clientId);
+
         // Route message to subscribers (QoS 0 and QoS 1)
         $this->routeMessage($packet, $clientId);
     }
@@ -553,8 +559,20 @@ final class PacketHandler
 
         // Route the stored QoS 2 message now that the publisher has confirmed delivery
         if ($storedPacket instanceof PublishPacket) {
+            $this->dispatchMessagePublished($storedPacket, $clientId);
             $this->routeMessage($storedPacket, $clientId);
         }
+    }
+
+    private function dispatchMessagePublished(PublishPacket $packet, string $clientId): void
+    {
+        $this->eventDispatcher?->dispatch(new MessagePublished(
+            topic: $packet->topicName,
+            payload: $packet->payload,
+            qos: $packet->qos,
+            retain: $packet->retain,
+            clientId: $clientId,
+        ));
     }
 
     private function handlePubcomp(Connection $connection, PacketInterface $packet): void
