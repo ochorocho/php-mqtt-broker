@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+## #ddev-generated: If you want to edit and own this file, remove this line.
+## Description: Launch a browser with MQTT Explorer
+## Usage: mqtt-explorer
+## Example: "ddev mqtt-explorer"
+
+# Determine whether to use HTTP or HTTPS based on environment
+PROTOCOL="HTTP"
+if [ "${DDEV_PRIMARY_URL%://*}" != "http" ] && [ -z "${GITPOD_WORKSPACE_ID:-}" ] && [ "${CODESPACES:-}" != "true" ]; then
+    PROTOCOL="HTTPS"
+fi
+
+# Fetch the appropriate port from the mqtt-explorer container
+DDEV_MQTT_EXPLORER_PORT=$(ddev exec -s mqtt-explorer sh -c "printenv | grep -w ${PROTOCOL}_EXPOSE | cut -d '=' -f 2 | cut -d ':' -f 1")
+
+if [ -z "$DDEV_MQTT_EXPLORER_PORT" ]; then
+    echo "Error: Could not retrieve MQTT Explorer port."
+    exit 1
+fi
+
+ddev launch :"$DDEV_MQTT_EXPLORER_PORT"

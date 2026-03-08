@@ -1,0 +1,4 @@
+services:
+  web:
+    ports:
+      - "1883:1883"

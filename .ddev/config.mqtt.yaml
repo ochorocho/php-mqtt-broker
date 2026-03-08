@@ -1,0 +1,7 @@
+# web_extra_daemons:
+#   - name: mqtt-broker
+#     command: "php /var/www/html/bin/mqtt-broker"
+#     directory: /var/www/html
+
+webimage_extra_packages:
+  - mosquitto-clients

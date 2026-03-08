@@ -1,0 +1,9 @@
+name: mqtt-explorer
+repository: ../ddev-mqtt-explorer
+version: ""
+install_date: "2026-03-08T13:47:43+01:00"
+project_files:
+    - docker-compose.mqtt-explorer.yaml
+    - commands/host/mqtt-explorer
+global_files: []
+removal_actions: []

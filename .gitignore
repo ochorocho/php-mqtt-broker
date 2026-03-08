@@ -1,0 +1,4 @@
+/.phpstan-cache
+/.phpunit.result.cache
+/paho.mqtt.testing
+/vendor/

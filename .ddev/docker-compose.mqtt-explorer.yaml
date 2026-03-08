@@ -1,0 +1,32 @@
+#ddev-generated
+# Remove the line above if you don't want this file to be overwritten
+# when you run ddev add-on get ochorocho/ddev-mqtt-explorer
+services:
+  mqtt-explorer:
+    container_name: ddev-${DDEV_SITENAME}-mqtt-explorer
+    hostname: ${DDEV_SITENAME}-mqtt-explorer
+    image: ${MQTT_EXPLORER_DOCKER_IMAGE:-smeagolworms4/mqtt-explorer:latest}
+    restart: "no"
+    expose:
+      - "4000"
+    labels:
+      com.ddev.site-name: ${DDEV_SITENAME}
+      com.ddev.approot: ${DDEV_APPROOT}
+    environment:
+      - VIRTUAL_HOST=$DDEV_HOSTNAME
+      - HTTP_EXPOSE=4200:4000
+      - HTTPS_EXPOSE=4201:4000
+      - INITIAL_CONFIG={"ConnectionManager_connections":{"ddev-mqtt-broker":{"configVersion":1,"type":"mqtt","id":"ddev-mqtt-broker","name":"DDEV MQTT Broker","host":"web","port":1883,"protocol":"mqtt","encryption":false,"certValidation":false,"subscriptions":[{"topic":"#","qos":0},{"topic":"$$SYS/#","qos":0}]}}}
+    volumes:
+      - ".:/mnt/ddev_config"
+      - "ddev-global-cache:/mnt/ddev-global-cache"
+      - "mqtt-explorer-data:/mqtt-explorer/config"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:4000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mqtt-explorer-data:

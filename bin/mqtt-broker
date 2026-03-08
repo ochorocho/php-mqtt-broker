@@ -1,0 +1,42 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use PhpMqtt\Broker\Broker;
+use PhpMqtt\Broker\Configuration;
+
+$options = getopt('', [
+    'host:',
+    'port:',
+]);
+
+$config = new Configuration(
+    host: is_string($options['host'] ?? null) ? $options['host'] : '0.0.0.0',
+    port: (int) ($options['port'] ?? 1883),
+);
+
+$logger = new class extends \Psr\Log\AbstractLogger {
+    public function log($level, \Stringable|string $message, array $context = []): void
+    {
+        $msg = str_replace(
+            array_map(fn($k) => '{' . $k . '}', array_keys($context)),
+            array_map(fn($v) => $v instanceof \Throwable ? $v->getMessage() . "\n" . $v->getTraceAsString() : (string) $v, array_values($context)),
+            (string) $message,
+        );
+        fwrite(STDERR, sprintf("[%s] %s: %s\n", date('H:i:s'), $level, $msg));
+    }
+};
+
+$broker = new Broker(config: $config, logger: $logger);
+
+if (function_exists('pcntl_async_signals')) {
+    pcntl_async_signals(true);
+    pcntl_signal(SIGINT, static fn() => $broker->stop());
+    pcntl_signal(SIGTERM, static fn() => $broker->stop());
+}
+
+echo sprintf("MQTT Broker listening on %s:%d\n", $config->host, $config->port);
+$broker->start();
