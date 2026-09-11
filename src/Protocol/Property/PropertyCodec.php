@@ -85,9 +85,15 @@ final class PropertyCodec
     }
 
     /**
-     * Encode an empty property set (just the length = 0).
+     * Encode a property block that may be absent. A packet with no properties still
+     * carries a zero length, so the field is never simply omitted.
      */
-    public static function encodeEmpty(): string
+    public static function encodeOrEmpty(?PropertyCollection $collection): string
+    {
+        return $collection !== null ? self::encode($collection) : self::encodeEmpty();
+    }
+
+    private static function encodeEmpty(): string
     {
         return DataType::encodeVariableByteInteger(0);
     }

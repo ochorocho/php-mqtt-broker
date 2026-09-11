@@ -3,7 +3,21 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/../vendor/autoload.php';
+// Composer's bin proxy sets this; the fallbacks cover running the script directly,
+// either from a clone or from inside a consumer's vendor directory.
+$autoload = $GLOBALS['_composer_autoload_path']
+    ?? (static function (): string {
+        foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $candidate) {
+            if (is_file($candidate)) {
+                return $candidate;
+            }
+        }
+
+        fwrite(STDERR, "Could not find the Composer autoloader. Run 'composer install' first.\n");
+        exit(1);
+    })();
+
+require $autoload;
 
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
 use PhpMqtt\Broker\Auth\AuthenticatorLoader;

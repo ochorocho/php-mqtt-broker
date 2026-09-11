@@ -11,8 +11,6 @@ use PHPUnit\Framework\TestCase;
 
 final class DataTypeTest extends TestCase
 {
-    // --- Variable Byte Integer ---
-
     public function testEncodeVariableByteIntegerZero(): void
     {
         self::assertSame("\x00", DataType::encodeVariableByteInteger(0));
@@ -108,8 +106,6 @@ final class DataTypeTest extends TestCase
         DataType::decodeVariableByteInteger($data, $offset);
     }
 
-    // --- Two Byte Integer ---
-
     public function testEncodeTwoByteInteger(): void
     {
         self::assertSame("\x00\x00", DataType::encodeTwoByteInteger(0));
@@ -141,8 +137,6 @@ final class DataTypeTest extends TestCase
         DataType::encodeTwoByteInteger(65536);
     }
 
-    // --- Four Byte Integer ---
-
     public function testEncodeFourByteInteger(): void
     {
         self::assertSame("\x00\x00\x00\x00", DataType::encodeFourByteInteger(0));
@@ -167,8 +161,6 @@ final class DataTypeTest extends TestCase
         $offset = 0;
         DataType::decodeFourByteInteger("\x00\x00", $offset);
     }
-
-    // --- UTF-8 String ---
 
     public function testEncodeUtf8String(): void
     {
@@ -218,8 +210,6 @@ final class DataTypeTest extends TestCase
         DataType::encodeUtf8String("bad\x00string");
     }
 
-    // --- Binary Data ---
-
     public function testEncodeBinaryData(): void
     {
         $data = "\x00\x01\x02\xFF";
@@ -242,8 +232,6 @@ final class DataTypeTest extends TestCase
         DataType::decodeBinaryData("\x00\x04\x00\x01", $offset);
     }
 
-    // --- UTF-8 String Pair ---
-
     public function testEncodeUtf8StringPair(): void
     {
         $encoded = DataType::encodeUtf8StringPair('key', 'value');
@@ -259,8 +247,6 @@ final class DataTypeTest extends TestCase
         self::assertSame(['name', 'test'], $result);
         self::assertSame(strlen($encoded), $offset);
     }
-
-    // --- Byte ---
 
     public function testEncodeByte(): void
     {

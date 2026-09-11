@@ -236,6 +236,33 @@ $broker = new Broker(
 $broker->start();
 ```
 
+### Events
+
+Pass any PSR-14 event dispatcher to observe broker activity:
+
+```php
+use PhpMqtt\Broker\Event\MessagePublished;
+
+$broker = new Broker(
+    config: new Configuration(),
+    eventDispatcher: $dispatcher,
+);
+$broker->start();
+```
+
+One event is dispatched today:
+
+| Event              | Dispatched when                                                    | Properties                                                   |
+|--------------------|--------------------------------------------------------------------|--------------------------------------------------------------|
+| `MessagePublished` | A client's PUBLISH is accepted, before it is routed to subscribers | `topic`, `payload`, `qos`, `retain`, `clientId`, `timestamp` |
+
+For QoS 0 and 1 it fires as the PUBLISH arrives. For QoS 2 it fires once, on
+PUBREL, when the publisher confirms delivery — so a message is never reported
+twice, and never before the sender has committed to it.
+
+It is not dispatched for a publish the authenticator denied, nor for will
+messages, which the broker sends on a client's behalf rather than receiving.
+
 ## Testing with MQTT Clients
 
 Once the broker is running, connect with any MQTT client:

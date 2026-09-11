@@ -89,8 +89,6 @@ final class SubscribePacketTest extends TestCase
         SubscribePacket::decode($data);
     }
 
-    // --- SUBACK ---
-
     public function testSubackRoundTrip(): void
     {
         $packet = new SubackPacket(
@@ -105,8 +103,6 @@ final class SubscribePacketTest extends TestCase
         self::assertSame(10, $decoded->packetId);
         self::assertSame([0x00, 0x01, 0x02, 0x80], $decoded->returnCodes);
     }
-
-    // --- UNSUBSCRIBE ---
 
     public function testUnsubscribeRoundTrip(): void
     {

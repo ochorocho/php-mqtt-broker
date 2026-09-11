@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker;
 
+use PhpMqtt\Broker\Protocol\PacketStream;
+
 final class Configuration
 {
     /**
@@ -39,7 +41,7 @@ final class Configuration
         public readonly int $maxConnections = 10000,
         public readonly ?string $tlsCertPath = null,
         public readonly ?string $tlsKeyPath = null,
-        public readonly int $maxPacketSize = 1048576,
+        public readonly int $maxPacketSize = PacketStream::DEFAULT_MAX_PACKET_SIZE,
         public readonly float $connectTimeout = 10.0,
         public readonly int $minKeepAlive = 300,
         public readonly int $maxSessions = 10000,

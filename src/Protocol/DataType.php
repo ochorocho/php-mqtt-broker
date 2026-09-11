@@ -10,6 +10,12 @@ final class DataType
 {
     private const int VARIABLE_BYTE_INT_MAX = 268_435_455;
 
+    /** A fifth continuation byte would exceed the variable byte integer range. */
+    private const int VARIABLE_BYTE_INT_MAX_MULTIPLIER = 128 * 128 * 128;
+
+    private const int TWO_BYTE_MAX = 0xFFFF;
+    private const int FOUR_BYTE_MAX = 0xFFFFFFFF;
+
     public static function encodeVariableByteInteger(int $value): string
     {
         if ($value < 0 || $value > self::VARIABLE_BYTE_INT_MAX) {
@@ -45,7 +51,7 @@ final class DataType
             $byte = ord($data[$offset++]);
             $value += ($byte & 0x7F) * $multiplier;
 
-            if ($multiplier > 128 * 128 * 128) {
+            if ($multiplier > self::VARIABLE_BYTE_INT_MAX_MULTIPLIER) {
                 throw new MalformedPacketException('Malformed variable byte integer: too many bytes');
             }
 
@@ -57,9 +63,9 @@ final class DataType
 
     public static function encodeTwoByteInteger(int $value): string
     {
-        if ($value < 0 || $value > 0xFFFF) {
+        if ($value < 0 || $value > self::TWO_BYTE_MAX) {
             throw new MalformedPacketException(
-                sprintf('Two byte integer value %d out of range [0, 65535]', $value)
+                sprintf('Two byte integer value %d out of range [0, %d]', $value, self::TWO_BYTE_MAX)
             );
         }
 
@@ -81,9 +87,9 @@ final class DataType
 
     public static function encodeFourByteInteger(int $value): string
     {
-        if ($value < 0 || $value > 0xFFFFFFFF) {
+        if ($value < 0 || $value > self::FOUR_BYTE_MAX) {
             throw new MalformedPacketException(
-                sprintf('Four byte integer value %d out of range [0, 4294967295]', $value)
+                sprintf('Four byte integer value %d out of range [0, %d]', $value, self::FOUR_BYTE_MAX)
             );
         }
 
@@ -108,9 +114,9 @@ final class DataType
         self::validateUtf8String($value);
 
         $length = strlen($value);
-        if ($length > 0xFFFF) {
+        if ($length > self::TWO_BYTE_MAX) {
             throw new MalformedPacketException(
-                sprintf('UTF-8 string length %d exceeds maximum 65535', $length)
+                sprintf('UTF-8 string length %d exceeds maximum %d', $length, self::TWO_BYTE_MAX)
             );
         }
 
@@ -119,8 +125,20 @@ final class DataType
 
     public static function decodeUtf8String(string $data, int &$offset): string
     {
+        $value = self::decodeLengthPrefixed($data, $offset, 'UTF-8 string');
+        self::validateUtf8String($value);
+
+        return $value;
+    }
+
+    /**
+     * Read a two-byte length followed by that many bytes. Shared by the UTF-8 string
+     * and binary data types, which differ only in the validation that follows.
+     */
+    private static function decodeLengthPrefixed(string $data, int &$offset, string $what): string
+    {
         if ($offset + 2 > strlen($data)) {
-            throw new MalformedPacketException('Incomplete UTF-8 string length');
+            throw new MalformedPacketException(sprintf('Incomplete %s length', $what));
         }
 
         /** @var array{1: int} $result */
@@ -129,13 +147,11 @@ final class DataType
         $offset += 2;
 
         if ($offset + $length > strlen($data)) {
-            throw new MalformedPacketException('Incomplete UTF-8 string data');
+            throw new MalformedPacketException(sprintf('Incomplete %s data', $what));
         }
 
         $value = substr($data, $offset, $length);
         $offset += $length;
-
-        self::validateUtf8String($value);
 
         return $value;
     }
@@ -169,9 +185,9 @@ final class DataType
     public static function encodeBinaryData(string $value): string
     {
         $length = strlen($value);
-        if ($length > 0xFFFF) {
+        if ($length > self::TWO_BYTE_MAX) {
             throw new MalformedPacketException(
-                sprintf('Binary data length %d exceeds maximum 65535', $length)
+                sprintf('Binary data length %d exceeds maximum %d', $length, self::TWO_BYTE_MAX)
             );
         }
 
@@ -180,23 +196,7 @@ final class DataType
 
     public static function decodeBinaryData(string $data, int &$offset): string
     {
-        if ($offset + 2 > strlen($data)) {
-            throw new MalformedPacketException('Incomplete binary data length');
-        }
-
-        /** @var array{1: int} $result */
-        $result = unpack('n', $data, $offset);
-        $length = $result[1];
-        $offset += 2;
-
-        if ($offset + $length > strlen($data)) {
-            throw new MalformedPacketException('Incomplete binary data');
-        }
-
-        $value = substr($data, $offset, $length);
-        $offset += $length;
-
-        return $value;
+        return self::decodeLengthPrefixed($data, $offset, 'binary');
     }
 
     /**

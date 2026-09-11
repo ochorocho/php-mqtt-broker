@@ -28,7 +28,11 @@ use PhpMqtt\Broker\Protocol\Packet\UnsubscribePacket;
 use PhpMqtt\Broker\Protocol\PacketEncoder;
 use PhpMqtt\Broker\Protocol\Property\PropertyCollection;
 use PhpMqtt\Broker\Protocol\Property\PropertyId;
+use PhpMqtt\Broker\Protocol\ConnectReasonCode;
+use PhpMqtt\Broker\Protocol\DisconnectReasonCode;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
+use PhpMqtt\Broker\Protocol\PubackReasonCode;
+use PhpMqtt\Broker\Protocol\SubackReasonCode;
 use PhpMqtt\Broker\Protocol\TopicFilter;
 use PhpMqtt\Broker\Session\SessionManager;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
@@ -43,23 +47,12 @@ final class PacketHandler
     private const int SERVER_RECEIVE_MAXIMUM = 20;
     private const int SERVER_TOPIC_ALIAS_MAXIMUM = 10;
     private const int SERVER_KEEP_ALIVE = 60;
-    private const int SERVER_MAXIMUM_PACKET_SIZE = 1048576;
     private const int MAX_SHARED_SUB_COUNTERS = 10000;
 
     private readonly RetainedMessageStore $retainedMessages;
     private readonly SessionManager $sessionManager;
 
-    /** @var array<string, array<int, PublishPacket>> clientId => [packetId => PublishPacket] for QoS 2 incoming */
-    private array $pendingIncomingQoS2 = [];
-
-    /** @var array<string, int> clientId => next packet ID */
-    private array $nextPacketId = [];
-
-    /** @var array<string, array<int, PublishPacket>> clientId => [packetId => PublishPacket] pending outgoing QoS 1/2 */
-    private array $pendingOutgoing = [];
-
-    /** @var array<string, array<int, true>> clientId => [packetId => true] QoS 2 outgoing PUBREC received */
-    private array $pendingQoS2Release = [];
+    private readonly InFlightMessageTracker $inFlight;
 
     /** @var array<string, \React\EventLoop\TimerInterface> clientId => will delay timer */
     private array $willDelayTimers = [];
@@ -82,6 +75,7 @@ final class PacketHandler
             maxBytes: $this->config->maxRetainedBytes,
         );
         $this->sessionManager = new SessionManager(maxSessions: $this->config->maxSessions);
+        $this->inFlight = new InFlightMessageTracker();
     }
 
     public function getRetainedMessages(): RetainedMessageStore
@@ -96,12 +90,10 @@ final class PacketHandler
 
     public function handle(Connection $connection, PacketInterface $packet): void
     {
-        // First packet must be CONNECT
         if (!$connection->isConnected() && !($packet instanceof ConnectPacket)) {
             throw new ProtocolViolationException('First packet must be CONNECT');
         }
 
-        // Only one CONNECT allowed
         if ($connection->isConnected() && $packet instanceof ConnectPacket) {
             throw new ProtocolViolationException('Second CONNECT packet received');
         }
@@ -138,7 +130,6 @@ final class PacketHandler
         $connection->markDisconnectHandled();
         $connection->setConnected(false);
 
-        // Publish will message if abnormal disconnect
         if (!$clean && $connection->hasWill()) {
             $willDelayInterval = 0;
             $willProps = $connection->getWillProperties();
@@ -177,15 +168,13 @@ final class PacketHandler
 
         $connection->cancelKeepAliveTimer();
 
-        // Session handling: determine whether to persist or destroy the session
         $shouldSaveSession = $this->shouldPersistSession($connection);
 
         if (!$shouldSaveSession) {
             $this->subscriptionManager->removeClient($clientId);
             $this->sessionManager->destroy($clientId);
-            $this->cleanupClientState($clientId);
+            $this->inFlight->forget($clientId);
         } else {
-            // Save session state
             $subscriptions = array_values($this->subscriptionManager->getClientSubscriptions($clientId));
             $session = $this->sessionManager->getOrCreate($clientId);
             $session->subscriptions = $subscriptions;
@@ -209,14 +198,11 @@ final class PacketHandler
 
             // Save pending outgoing messages (QoS 1/2 not yet acknowledged)
             // so they can be redelivered on reconnect
-            if (isset($this->pendingOutgoing[$clientId])) {
-                foreach ($this->pendingOutgoing[$clientId] as $pendingPacket) {
-                    $this->queuePendingMessage($session, $pendingPacket);
-                }
+            foreach ($this->inFlight->unacknowledged($clientId) as $pendingPacket) {
+                $this->queuePendingMessage($session, $pendingPacket);
             }
 
-            // Clean up in-memory state for the disconnected client
-            $this->cleanupClientState($clientId);
+            $this->inFlight->forget($clientId);
         }
     }
 
@@ -229,7 +215,6 @@ final class PacketHandler
         // CONNECT has arrived; the pre-auth deadline no longer applies.
         $connection->cancelConnectTimer();
 
-        // Validate protocol
         if ($packet->protocolName !== 'MQTT') {
             $connection->close();
             return;
@@ -237,8 +222,10 @@ final class PacketHandler
 
         $version = ProtocolVersion::tryFrom($packet->protocolLevel);
         if ($version === null) {
-            // Unacceptable protocol version
-            $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x01));
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: ConnectReasonCode::UnacceptableProtocolVersion->value,
+            ));
             $connection->close();
             return;
         }
@@ -250,14 +237,15 @@ final class PacketHandler
         if (strlen($packet->clientId) > $this->config->maxClientIdLength) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x85 : 0x02,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::ClientIdentifierNotValid->value
+                    : ConnectReasonCode::IdentifierRejected->value,
                 protocolVersion: $version,
             ));
             $connection->close();
             return;
         }
 
-        // Generate client ID if empty
         $clientId = $packet->clientId;
         if ($clientId === '') {
             if ($version === ProtocolVersion::V50) {
@@ -267,7 +255,10 @@ final class PacketHandler
             } else {
                 // MQTT 3.1.1: empty client ID requires clean session
                 if (!$packet->cleanSession) {
-                    $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x02));
+                    $connection->send(new ConnackPacket(
+                        sessionPresent: false,
+                        returnCode: ConnectReasonCode::IdentifierRejected->value,
+                    ));
                     $connection->close();
                     return;
                 }
@@ -275,7 +266,6 @@ final class PacketHandler
             }
         }
 
-        // Authenticate
         if (!$this->authorize(
             fn(): bool => $this->authenticator->authenticate($clientId, $packet->username, $packet->password),
             'authenticate',
@@ -283,7 +273,9 @@ final class PacketHandler
         )) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x86 : 0x05,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::BadUserNameOrPassword->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
                 protocolVersion: $version,
             ));
             $connection->close();
@@ -300,7 +292,9 @@ final class PacketHandler
         )) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::NotAuthorized->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
                 protocolVersion: $version,
             ));
             $connection->close();
@@ -319,14 +313,15 @@ final class PacketHandler
         ) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::NotAuthorized->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
                 protocolVersion: $version,
             ));
             $connection->close();
             return;
         }
 
-        // Take over existing connection with same client ID
         $existing = $this->connectionManager->getByClientId($clientId);
         if ($existing !== null) {
             $this->handleDisconnect($existing, false);
@@ -334,7 +329,6 @@ final class PacketHandler
             $this->connectionManager->remove($existing);
         }
 
-        // Cancel any existing will delay timer for this client ID
         if (isset($this->willDelayTimers[$clientId])) {
             $this->loop->cancelTimer($this->willDelayTimers[$clientId]);
             unset($this->willDelayTimers[$clientId]);
@@ -344,7 +338,6 @@ final class PacketHandler
         $connection->setConnected(true);
         $connection->setCleanSession($packet->cleanSession);
 
-        // MQTT 5.0: extract CONNECT properties
         if ($version === ProtocolVersion::V50 && $packet->properties !== null) {
             $sei = $packet->properties->get(PropertyId::SessionExpiryInterval);
             if ($sei !== null) {
@@ -367,7 +360,6 @@ final class PacketHandler
             }
         }
 
-        // Clear topic aliases on (re)connect
         $connection->clearTopicAliases();
 
         // Set keepalive: for v5.0, cap at SERVER_KEEP_ALIVE if client's value exceeds it
@@ -388,7 +380,6 @@ final class PacketHandler
 
         $this->connectionManager->register($clientId, $connection);
 
-        // Will message
         if ($packet->hasWill && $packet->willTopic !== null) {
             $connection->setWill(
                 $packet->willTopic,
@@ -399,12 +390,11 @@ final class PacketHandler
             );
         }
 
-        // Session handling
         $sessionPresent = false;
         if ($packet->cleanSession) {
             $this->sessionManager->destroy($clientId);
             $this->subscriptionManager->removeClient($clientId);
-            $this->cleanupClientState($clientId);
+            $this->inFlight->forget($clientId);
         } else {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
@@ -432,13 +422,12 @@ final class PacketHandler
         $preSession = $this->sessionManager->getOrCreate($clientId);
         $preSession->protocolVersion = $version;
 
-        // Build CONNACK properties for MQTT 5.0
         $connackProps = null;
         if ($version === ProtocolVersion::V50) {
             $connackProps = new PropertyCollection();
             $connackProps->set(PropertyId::ReceiveMaximum, self::SERVER_RECEIVE_MAXIMUM);
             $connackProps->set(PropertyId::TopicAliasMaximum, self::SERVER_TOPIC_ALIAS_MAXIMUM);
-            $connackProps->set(PropertyId::MaximumPacketSize, self::SERVER_MAXIMUM_PACKET_SIZE);
+            $connackProps->set(PropertyId::MaximumPacketSize, $this->config->maxPacketSize);
             if ($overrideKeepAlive) {
                 $connackProps->set(PropertyId::ServerKeepAlive, self::SERVER_KEEP_ALIVE);
             }
@@ -453,12 +442,11 @@ final class PacketHandler
 
         $connection->send(new ConnackPacket(
             sessionPresent: $sessionPresent,
-            returnCode: 0x00,
+            returnCode: ConnectReasonCode::Success->value,
             protocolVersion: $version,
             properties: $connackProps,
         ));
 
-        // Start keepalive timer
         if ($effectiveKeepAlive > 0) {
             $connection->startKeepAliveTimer(function (Connection $conn): void {
                 $this->logger->debug('Keep alive timeout for {client}', ['client' => $conn->getClientId()]);
@@ -467,12 +455,10 @@ final class PacketHandler
             });
         }
 
-        // Deliver pending messages from session
         if ($sessionPresent) {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
                 foreach ($session->pendingMessages as $msg) {
-                    // Check message expiry for MQTT 5.0
                     if ($version === ProtocolVersion::V50 && $msg->properties !== null) {
                         $expiryInterval = $msg->properties->get(PropertyId::MessageExpiryInterval);
                         if ($expiryInterval !== null && $session->disconnectedAt > 0.0) {
@@ -481,15 +467,13 @@ final class PacketHandler
                             if ($remaining <= 0) {
                                 continue; // Message expired, skip
                             }
-                            // Update the expiry interval on the message
                             $msg->properties->remove(PropertyId::MessageExpiryInterval);
                             $msg->properties->set(PropertyId::MessageExpiryInterval, $remaining);
                         }
                     }
 
-                    // Always create new packet with correct protocol version
                     $packetId = $msg->qos > 0
-                        ? ($msg->packetId ?? $this->allocatePacketId($clientId))
+                        ? ($msg->packetId ?? $this->inFlight->allocatePacketId($clientId))
                         : null;
                     $deliverMsg = new PublishPacket(
                         topicName: $msg->topicName,
@@ -501,11 +485,7 @@ final class PacketHandler
                         protocolVersion: $connection->getProtocolVersion(),
                         properties: $msg->properties,
                     );
-                    if ($deliverMsg->qos > 0 && $deliverMsg->packetId !== null) {
-                        $this->pendingOutgoing[$clientId][$deliverMsg->packetId] = $deliverMsg;
-                        $connection->incrementUnackedOutgoing();
-                    }
-                    $connection->send($deliverMsg);
+                    $this->inFlight->sendTracked($connection, $deliverMsg, $clientId);
                 }
                 $session->pendingMessages = [];
             }
@@ -524,38 +504,33 @@ final class PacketHandler
             return;
         }
 
-        // MQTT 5.0: topic alias resolution
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->properties !== null) {
             $topicAlias = $packet->properties->get(PropertyId::TopicAlias);
             if ($topicAlias !== null) {
                 $alias = (int) $topicAlias;
                 if ($alias === 0 || $alias > self::SERVER_TOPIC_ALIAS_MAXIMUM) {
-                    // Topic Alias invalid — send DISCONNECT 0x94
                     $connection->send(new DisconnectPacket(
                         protocolVersion: ProtocolVersion::V50,
-                        reasonCode: 0x94,
+                        reasonCode: DisconnectReasonCode::TopicAliasInvalid->value,
                     ));
                     $connection->close();
                     return;
                 }
                 if ($packet->topicName !== '') {
-                    // Establishing alias
                     $connection->setIncomingTopicAlias($alias, $packet->topicName);
                     $resolvedTopic = $packet->topicName;
                 } else {
-                    // Using existing alias
                     $resolvedTopic = $connection->resolveIncomingTopicAlias($alias);
                     if ($resolvedTopic === null) {
                         // Alias not yet established — protocol error
                         $connection->send(new DisconnectPacket(
                             protocolVersion: ProtocolVersion::V50,
-                            reasonCode: 0x94,
+                            reasonCode: DisconnectReasonCode::TopicAliasInvalid->value,
                         ));
                         $connection->close();
                         return;
                     }
                 }
-                // Create a new packet with the resolved topic
                 $packet = new PublishPacket(
                     topicName: $resolvedTopic,
                     payload: $packet->payload,
@@ -569,15 +544,14 @@ final class PacketHandler
             }
         }
 
-        // MQTT 5.0: server receive maximum enforcement for QoS 1/2
         if ($packet->qos > 0) {
-            $incomingCount = count($this->pendingIncomingQoS2[$clientId] ?? []);
+            $incomingCount = $this->inFlight->countIncoming($clientId);
             if ($incomingCount >= self::SERVER_RECEIVE_MAXIMUM) {
                 $connection->setConnected(false);
                 if ($connection->getProtocolVersion() === ProtocolVersion::V50) {
                     $connection->send(new DisconnectPacket(
                         protocolVersion: ProtocolVersion::V50,
-                        reasonCode: 0x93,
+                        reasonCode: DisconnectReasonCode::ReceiveMaximumExceeded->value,
                     ));
                 }
                 // Defer close to allow client to read the DISCONNECT packet
@@ -605,7 +579,6 @@ final class PacketHandler
             return;
         }
 
-        // Handle retained messages
         if ($packet->retain) {
             if ($packet->payload === '') {
                 $this->retainedMessages->remove($packet->topicName);
@@ -614,7 +587,6 @@ final class PacketHandler
             }
         }
 
-        // QoS 1: Send PUBACK to publisher
         if ($packet->qos === 1 && $packet->packetId !== null) {
             $connection->send(new PubackPacket(
                 packetId: $packet->packetId,
@@ -624,7 +596,7 @@ final class PacketHandler
 
         // QoS 2: Send PUBREC to publisher, defer delivery until PUBREL
         if ($packet->qos === 2 && $packet->packetId !== null) {
-            $this->pendingIncomingQoS2[$clientId][$packet->packetId] = $packet;
+            $this->inFlight->holdIncoming($clientId, $packet);
             $connection->send(new PubrecPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $connection->getProtocolVersion(),
@@ -632,10 +604,8 @@ final class PacketHandler
             return; // Don't deliver yet — wait for PUBREL
         }
 
-        // Dispatch event for QoS 0 and QoS 1 messages
         $this->dispatchMessagePublished($packet, $clientId);
 
-        // Route message to subscribers (QoS 0 and QoS 1)
         $this->routeMessage($packet, $clientId);
     }
 
@@ -649,7 +619,7 @@ final class PacketHandler
             return;
         }
 
-        unset($this->pendingOutgoing[$clientId][$packet->packetId]);
+        $this->inFlight->acknowledgeOutgoing($clientId, $packet->packetId);
         $connection->decrementUnackedOutgoing();
         $this->drainPendingMessages($connection);
     }
@@ -664,9 +634,7 @@ final class PacketHandler
             return;
         }
 
-        // Mark as received, send PUBREL
-        unset($this->pendingOutgoing[$clientId][$packet->packetId]);
-        $this->pendingQoS2Release[$clientId][$packet->packetId] = true;
+        $this->inFlight->awaitPubcomp($clientId, $packet->packetId);
 
         $connection->send(new PubrelPacket(
             packetId: $packet->packetId,
@@ -684,9 +652,7 @@ final class PacketHandler
             return;
         }
 
-        // Complete QoS 2 incoming flow: retrieve the stored message and route it
-        $storedPacket = $this->pendingIncomingQoS2[$clientId][$packet->packetId] ?? null;
-        unset($this->pendingIncomingQoS2[$clientId][$packet->packetId]);
+        $storedPacket = $this->inFlight->takeIncoming($clientId, $packet->packetId);
 
         $connection->send(new PubcompPacket(
             packetId: $packet->packetId,
@@ -721,7 +687,7 @@ final class PacketHandler
             return;
         }
 
-        unset($this->pendingQoS2Release[$clientId][$packet->packetId]);
+        $this->inFlight->completeOutgoing($clientId, $packet->packetId);
         $connection->decrementUnackedOutgoing();
         $this->drainPendingMessages($connection);
     }
@@ -738,7 +704,6 @@ final class PacketHandler
 
         $version = $connection->getProtocolVersion();
 
-        // Extract subscription identifier from SUBSCRIBE properties (MQTT 5.0)
         $subscriptionIdentifier = 0;
         if ($version === ProtocolVersion::V50 && $packet->properties !== null) {
             $subId = $packet->properties->get(PropertyId::SubscriptionIdentifier);
@@ -769,14 +734,14 @@ final class PacketHandler
             // A malformed filter used to be accepted and granted, leaving the client
             // believing it had subscribed to something the broker stored as a literal.
             if (!TopicFilter::isValidFilter($topic) || !TopicFilter::isValidSharedFilter($topic)) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
             // Bound trie growth: deep filters and unlimited subscriptions per client are
             // both cheap ways to allocate nodes that used to be kept for the process life.
             if (substr_count($topic, '/') + 1 > $this->config->maxTopicLevels) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
@@ -784,7 +749,7 @@ final class PacketHandler
                 && $this->subscriptionManager->countClientSubscriptions($clientId)
                     >= $this->config->maxSubscriptionsPerClient
             ) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
@@ -794,11 +759,10 @@ final class PacketHandler
                 $clientId,
                 $topic,
             )) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
-            // Check if subscription already exists before subscribing (for retainHandling)
             $existingSubscription = $this->subscriptionManager->hasSubscription($clientId, $topic);
 
             $this->subscriptionManager->subscribe(
@@ -812,78 +776,14 @@ final class PacketHandler
             );
             $returnCodes[] = $qos; // Granted QoS
 
-            // Determine the actual topic filter for retained message matching
-            // (strip $share/group/ prefix for shared subscriptions)
-            $retainedMatchTopic = TopicFilter::stripSharedPrefix($topic);
-
-            // Determine if retained messages should be sent
-            $shouldSendRetained = true;
-            if ($version === ProtocolVersion::V50) {
-                if ($retainHandling === 2) {
-                    $shouldSendRetained = false;
-                } elseif ($retainHandling === 1 && $existingSubscription) {
-                    $shouldSendRetained = false;
-                }
-            }
-
-            if (!$shouldSendRetained) {
-                continue;
-            }
-
-            // Deliver retained messages for this subscription
-            $retained = $this->retainedMessages->getMatching($retainedMatchTopic);
-            foreach ($retained as $retainedPacket) {
-                $deliverQoS = min($retainedPacket->qos, $qos);
-                $packetId = $deliverQoS > 0 ? $this->allocatePacketId($clientId) : null;
-
-                // Build properties for MQTT 5.0 retained message delivery
-                $retainedProps = null;
-                if ($version === ProtocolVersion::V50) {
-                    $retainedProps = new PropertyCollection();
-
-                    // Forward properties from the retained packet
-                    if ($retainedPacket->properties !== null) {
-                        $this->forwardProperties($retainedPacket->properties, $retainedProps);
-                    }
-
-                    // Add subscription identifier
-                    if ($subscriptionIdentifier > 0) {
-                        $retainedProps->set(PropertyId::SubscriptionIdentifier, $subscriptionIdentifier);
-                    }
-                }
-
-                $deliverPacket = new PublishPacket(
-                    topicName: $retainedPacket->topicName,
-                    payload: $retainedPacket->payload,
-                    qos: $deliverQoS,
-                    retain: true,
-                    packetId: $packetId,
-                    protocolVersion: $version,
-                    properties: $retainedProps,
+            if ($this->shouldSendRetained($version, $retainHandling, $existingSubscription)) {
+                $this->deliverRetainedMessages(
+                    $connection,
+                    $clientId,
+                    TopicFilter::stripSharedPrefix($topic),
+                    $qos,
+                    $subscriptionIdentifier,
                 );
-
-                // Retained delivery bypassed the checks the normal delivery path applies.
-                // Honour the client's maximum packet size (MQTT-3.1.2-24) rather than
-                // sending something it told us it cannot accept.
-                if ($version === ProtocolVersion::V50 && $connection->getClientMaximumPacketSize() > 0
-                    && strlen($this->packetEncoder->encode($deliverPacket)) > $connection->getClientMaximumPacketSize()
-                ) {
-                    continue;
-                }
-
-                // Respect the flow-control window; queue instead of sending past it.
-                if ($deliverQoS > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
-                    $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
-                    continue;
-                }
-
-                $connection->send($deliverPacket);
-                if ($deliverQoS > 0 && $deliverPacket->packetId !== null) {
-                    $this->pendingOutgoing[$clientId][$deliverPacket->packetId] = $deliverPacket;
-                    // Without this the counter drifts from pendingOutgoing and flow
-                    // control degrades for the rest of the session.
-                    $connection->incrementUnackedOutgoing();
-                }
             }
         }
 
@@ -892,6 +792,96 @@ final class PacketHandler
             returnCodes: $returnCodes,
             protocolVersion: $version,
         ));
+    }
+
+    /**
+     * Retain Handling lets a 5.0 client ask for the retained messages to be withheld,
+     * either always or when it was already subscribed (MQTT-3.8.3.1). 3.1.1 always
+     * sends them.
+     */
+    private function shouldSendRetained(ProtocolVersion $version, int $retainHandling, bool $alreadySubscribed): bool
+    {
+        if ($version !== ProtocolVersion::V50) {
+            return true;
+        }
+
+        return match ($retainHandling) {
+            2 => false,
+            1 => !$alreadySubscribed,
+            default => true,
+        };
+    }
+
+    /**
+     * Send the retained messages matching a new subscription.
+     *
+     * This path is subject to the same limits as ordinary delivery: it used to bypass
+     * both the client's maximum packet size and the flow-control window.
+     */
+    private function deliverRetainedMessages(
+        Connection $connection,
+        string $clientId,
+        string $topicFilter,
+        int $subscribedQoS,
+        int $subscriptionIdentifier,
+    ): void {
+        $version = $connection->getProtocolVersion();
+
+        foreach ($this->retainedMessages->getMatching($topicFilter) as $retainedPacket) {
+            $qos = min($retainedPacket->qos, $subscribedQoS);
+
+            $properties = null;
+            if ($version === ProtocolVersion::V50) {
+                $properties = new PropertyCollection();
+
+                if ($retainedPacket->properties !== null) {
+                    $this->forwardProperties($retainedPacket->properties, $properties);
+                }
+
+                if ($subscriptionIdentifier > 0) {
+                    $properties->set(PropertyId::SubscriptionIdentifier, $subscriptionIdentifier);
+                }
+            }
+
+            $deliverPacket = new PublishPacket(
+                topicName: $retainedPacket->topicName,
+                payload: $retainedPacket->payload,
+                qos: $qos,
+                retain: true,
+                packetId: $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null,
+                protocolVersion: $version,
+                properties: $properties,
+            );
+
+            if ($this->exceedsClientPacketSize($connection, $deliverPacket)) {
+                continue;
+            }
+
+            // Respect the flow-control window; queue instead of sending past it.
+            if ($qos > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
+                $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
+                continue;
+            }
+
+            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
+        }
+    }
+
+    /**
+     * A 5.0 client may declare a maximum packet size it will accept (MQTT-3.1.2-24).
+     *
+     * Only for retained delivery, where the connection is live and its version is the
+     * one to trust. deliverToClient has its own check for a reason; see there.
+     */
+    private function exceedsClientPacketSize(Connection $connection, PublishPacket $packet): bool
+    {
+        if ($connection->getProtocolVersion() !== ProtocolVersion::V50) {
+            return false;
+        }
+
+        $maximum = $connection->getClientMaximumPacketSize();
+
+        return $maximum > 0 && strlen($this->packetEncoder->encode($packet)) > $maximum;
     }
 
     private function handleUnsubscribe(Connection $connection, PacketInterface $packet): void
@@ -911,9 +901,9 @@ final class PacketHandler
             foreach ($packet->topicFilters as $filter) {
                 if ($this->subscriptionManager->hasSubscription($clientId, $filter)) {
                     $this->subscriptionManager->unsubscribe($clientId, $filter);
-                    $reasonCodes[] = 0x00; // Success
+                    $reasonCodes[] = SubackReasonCode::GrantedQos0->value;
                 } else {
-                    $reasonCodes[] = 0x11; // No subscription existed
+                    $reasonCodes[] = SubackReasonCode::NoSubscriptionExisted->value;
                 }
             }
 
@@ -947,7 +937,6 @@ final class PacketHandler
             throw new ProtocolViolationException('Expected DISCONNECT packet');
         }
 
-        // MQTT 5.0: check for SessionExpiryInterval override in DISCONNECT properties
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->properties !== null) {
             $newSEI = $packet->properties->get(PropertyId::SessionExpiryInterval);
             if ($newSEI !== null) {
@@ -955,8 +944,8 @@ final class PacketHandler
             }
         }
 
-        // MQTT 5.0 reason code 0x04 = Disconnect with Will Message
-        if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->reasonCode === 0x04) {
+        // The client is asking for its will to be published despite going away cleanly.
+        if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->reasonCode === DisconnectReasonCode::DisconnectWithWillMessage->value) {
             // Will should still be published despite clean disconnect
             $this->handleDisconnect($connection, false);
         } else {
@@ -1035,7 +1024,7 @@ final class PacketHandler
             $connection->send(new PubackPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? 0x87 : 0x00,
+                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
             ));
         }
 
@@ -1043,7 +1032,7 @@ final class PacketHandler
             $connection->send(new PubrecPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? 0x87 : 0x00,
+                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
             ));
         }
     }
@@ -1073,7 +1062,6 @@ final class PacketHandler
             return;
         }
 
-        // Build properties from will properties for MQTT 5.0
         $willProps = $connection->getWillProperties();
         $publishProps = null;
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $willProps !== null) {
@@ -1091,7 +1079,6 @@ final class PacketHandler
             properties: $publishProps,
         );
 
-        // Handle retained will messages
         if ($willPacket->retain) {
             if ($willPacket->payload === '') {
                 $this->retainedMessages->remove($willPacket->topicName);
@@ -1107,7 +1094,6 @@ final class PacketHandler
     {
         $subscriptions = $this->subscriptionManager->getMatchingSubscriptions($packet->topicName);
 
-        // Separate shared and non-shared subscriptions
         $normalSubs = [];
         /** @var array<string, array{group: string, subs: list<\PhpMqtt\Broker\Subscription\Subscription>}> */
         $sharedGroups = [];
@@ -1124,14 +1110,12 @@ final class PacketHandler
             }
         }
 
-        // Process normal subscriptions: group by client, take max QoS, collect subscription IDs
         // The client ID is carried in the entry rather than read back out of the key:
         // PHP turns a numeric-string key into an integer, so a client ID like "123"
         // came back as int(123) and only survived because of a cast at the call site.
         /** @var array<string, array{clientId: string, qos: int, subIds: list<int>, retainAsPublished: bool}> */
         $perClient = [];
         foreach ($normalSubs as $sub) {
-            // noLocal filtering: skip delivery to the publishing client
             if ($sub->noLocal && $sub->clientId === $publisherClientId) {
                 continue;
             }
@@ -1167,7 +1151,6 @@ final class PacketHandler
             );
         }
 
-        // Process shared subscriptions: pick one subscriber per group (round-robin)
         foreach ($sharedGroups as $group) {
             $groupName = $group['group'];
 
@@ -1223,46 +1206,41 @@ final class PacketHandler
         if ($connection !== null) {
             $version = $connection->getProtocolVersion();
         } else {
-            // Client is offline — use session's protocol version for correct encoding
             $session = $this->sessionManager->get($clientId);
             $version = $session !== null ? $session->protocolVersion : ProtocolVersion::V311;
         }
 
-        $packetId = $qos > 0 ? $this->allocatePacketId($clientId) : null;
+        $packetId = $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null;
 
-        // Determine topic name and outgoing topic alias for MQTT 5.0
         $topicName = $originalPacket->topicName;
         $aliasInfo = null;
         if ($version === ProtocolVersion::V50 && $connection !== null) {
             $aliasInfo = $connection->getOrCreateOutgoingTopicAlias($originalPacket->topicName);
+
+            // A new alias must carry the full topic name so the client can record it;
+            // an established one is sent as the alias alone.
             if ($aliasInfo !== null && !$aliasInfo['isNew']) {
-                $topicName = ''; // Reuse alias, omit topic name
+                $topicName = '';
             }
-            // if aliasInfo['isNew'] is true, keep full topicName (establishing alias)
         }
 
-        // Build properties for MQTT 5.0
         $properties = null;
         if ($version === ProtocolVersion::V50) {
             $properties = new PropertyCollection();
 
-            // Forward properties from original packet
             if ($originalPacket->properties !== null) {
                 $this->forwardProperties($originalPacket->properties, $properties);
             }
 
-            // Add topic alias
             if ($aliasInfo !== null) {
                 $properties->set(PropertyId::TopicAlias, $aliasInfo['alias']);
             }
 
-            // Add subscription identifiers
             foreach ($subscriptionIds as $subId) {
                 $properties->set(PropertyId::SubscriptionIdentifier, $subId);
             }
         }
 
-        // Retain flag: retainAsPublished preserves original, otherwise set to false
         $retainFlag = $retainAsPublished ? $originalPacket->retain : false;
 
         $deliverPacket = new PublishPacket(
@@ -1275,7 +1253,9 @@ final class PacketHandler
             properties: $properties,
         );
 
-        // Check client's maximum packet size (MQTT 5.0)
+        // Deliberately not exceedsClientPacketSize(): this path keys on $version, which
+        // for an offline client comes from the saved session rather than the connection.
+        // The two look like the same check and are not.
         if ($version === ProtocolVersion::V50 && $connection !== null && $connection->getClientMaximumPacketSize() > 0) {
             $encoded = $this->packetEncoder->encode($deliverPacket);
             if (strlen($encoded) > $connection->getClientMaximumPacketSize()) {
@@ -1284,9 +1264,7 @@ final class PacketHandler
         }
 
         if ($connection !== null && $connection->isConnected()) {
-            // Flow control: check ReceiveMaximum for QoS > 0
             if ($qos > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
-                // Queue instead of sending now — will be sent when ack is received
                 $session = $this->sessionManager->get($clientId);
                 if ($session === null) {
                     $session = $this->sessionManager->getOrCreate($clientId);
@@ -1295,13 +1273,8 @@ final class PacketHandler
                 return;
             }
 
-            $connection->send($deliverPacket);
-            if ($qos > 0 && $packetId !== null) {
-                $this->pendingOutgoing[$clientId][$packetId] = $deliverPacket;
-                $connection->incrementUnackedOutgoing();
-            }
+            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
         } else {
-            // Queue for offline persistent session
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
                 $this->queuePendingMessage($session, $deliverPacket);
@@ -1327,7 +1300,7 @@ final class PacketHandler
         while ($session->pendingMessages !== [] && ($connection->getUnackedOutgoing() < $connection->getReceiveMaximum())) {
             $msg = array_shift($session->pendingMessages);
             if ($msg->qos > 0) {
-                $packetId = $this->allocatePacketId($clientId);
+                $packetId = $this->inFlight->allocatePacketId($clientId);
                 $msg = new PublishPacket(
                     topicName: $msg->topicName,
                     payload: $msg->payload,
@@ -1338,10 +1311,8 @@ final class PacketHandler
                     protocolVersion: $msg->protocolVersion,
                     properties: $msg->properties,
                 );
-                $this->pendingOutgoing[$clientId][$packetId] = $msg;
-                $connection->incrementUnackedOutgoing();
             }
-            $connection->send($msg);
+            $this->inFlight->sendTracked($connection, $msg, $clientId);
         }
     }
 
@@ -1355,16 +1326,14 @@ final class PacketHandler
     private function shouldPersistSession(Connection $connection): bool
     {
         if ($connection->getProtocolVersion() === ProtocolVersion::V50) {
-            // In MQTT 5.0, session persistence is driven by SessionExpiryInterval
             if ($connection->getSessionExpiryInterval() > 0) {
                 return true;
             }
-            // SEI=0 means session expires immediately, but we still respect cleanSession=false
-            // for non-v5.0 compatible behavior
+            // SEI=0 means the session expires the moment the client disconnects, but a
+            // client that also sent cleanStart=false is asking to keep it, so honour that.
             return !$connection->isCleanSession();
         }
 
-        // MQTT 3.1.1: persist if cleanSession is false
         return !$connection->isCleanSession();
     }
 
@@ -1399,36 +1368,4 @@ final class PacketHandler
         }
     }
 
-    private function allocatePacketId(string $clientId): int
-    {
-        if (!isset($this->nextPacketId[$clientId])) {
-            $this->nextPacketId[$clientId] = 1;
-        }
-
-        $id = $this->nextPacketId[$clientId];
-        $this->nextPacketId[$clientId] = ($id >= 65535) ? 1 : $id + 1;
-
-        // Skip IDs that are in use
-        $maxAttempts = 65535;
-        while (
-            $maxAttempts > 0
-            && (isset($this->pendingOutgoing[$clientId][$id]) || isset($this->pendingQoS2Release[$clientId][$id]))
-        ) {
-            $id = $this->nextPacketId[$clientId];
-            $this->nextPacketId[$clientId] = ($id >= 65535) ? 1 : $id + 1;
-            $maxAttempts--;
-        }
-
-        return $id;
-    }
-
-    private function cleanupClientState(string $clientId): void
-    {
-        unset(
-            $this->pendingIncomingQoS2[$clientId],
-            $this->pendingOutgoing[$clientId],
-            $this->pendingQoS2Release[$clientId],
-            $this->nextPacketId[$clientId],
-        );
-    }
 }

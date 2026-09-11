@@ -61,11 +61,6 @@ final class RetainedMessageStore
         return count($this->messages);
     }
 
-    public function totalBytes(): int
-    {
-        return $this->totalBytes;
-    }
-
     /**
      * @return PublishPacket[]
      */

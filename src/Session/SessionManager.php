@@ -110,9 +110,4 @@ final class SessionManager
     {
         unset($this->sessions[$clientId]);
     }
-
-    public function exists(string $clientId): bool
-    {
-        return isset($this->sessions[$clientId]);
-    }
 }
