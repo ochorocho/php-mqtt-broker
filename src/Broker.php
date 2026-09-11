@@ -28,7 +28,6 @@ final class Broker
     private readonly PacketFactory $packetFactory;
     private readonly PacketEncoder $packetEncoder;
     private readonly PacketHandler $packetHandler;
-    public bool $running = false;
 
     public function __construct(
         private readonly Configuration $config = new Configuration(),
@@ -91,16 +90,13 @@ final class Broker
             }
         });
 
-        $this->running = true;
         $this->server->getLoop()->run();
     }
 
     public function stop(): void
     {
-        $this->running = false;
         $this->logger->info('MQTT Broker stopping');
 
-        // Close all connections
         foreach ($this->connectionManager->getAll() as $connection) {
             $connection->close();
         }

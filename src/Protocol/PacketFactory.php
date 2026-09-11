@@ -32,7 +32,6 @@ final class PacketFactory
             throw new MalformedPacketException('Packet too short');
         }
 
-        // Parse fixed header
         $firstByte = ord($rawPacket[0]);
         $typeValue = ($firstByte >> 4) & 0x0F;
         $flags = $firstByte & 0x0F;
@@ -42,7 +41,6 @@ final class PacketFactory
             throw new MalformedPacketException(sprintf('Unknown packet type %d', $typeValue));
         }
 
-        // Validate fixed header flags
         $expectedFlags = $packetType->expectedFlags();
         if ($expectedFlags !== null && $flags !== $expectedFlags) {
             throw new ProtocolViolationException(
@@ -50,11 +48,8 @@ final class PacketFactory
             );
         }
 
-        // Parse remaining length
         $offset = 1;
         $remainingLength = DataType::decodeVariableByteInteger($rawPacket, $offset);
-
-        // Extract variable header + payload
         $data = substr($rawPacket, $offset, $remainingLength);
 
         $v = $version ?? ProtocolVersion::V311;

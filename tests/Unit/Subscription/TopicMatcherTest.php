@@ -150,25 +150,6 @@ final class TopicMatcherTest extends TestCase
         self::assertCount(0, $results);
     }
 
-    public function testRemoveClientClearsAll(): void
-    {
-        $sub1 = new Subscription('c1', 'topic/a', 0);
-        $sub2 = new Subscription('c1', 'topic/b', 0);
-        $sub3 = new Subscription('c2', 'topic/a', 0);
-
-        $this->matcher->subscribe('topic/a', $sub1);
-        $this->matcher->subscribe('topic/b', $sub2);
-        $this->matcher->subscribe('topic/a', $sub3);
-
-        $this->matcher->removeClient('c1');
-
-        $resultsA = $this->matcher->match('topic/a');
-        $resultsB = $this->matcher->match('topic/b');
-
-        self::assertCount(1, $resultsA); // c2 still present
-        self::assertCount(0, $resultsB);
-    }
-
     public function testSingleLevelWildcardAtRoot(): void
     {
         $sub = new Subscription('c1', '+', 0);

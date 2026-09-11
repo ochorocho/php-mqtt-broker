@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Protocol\Packet;
 
-use PhpMqtt\Broker\Exception\MalformedPacketException;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
 use PhpMqtt\Broker\Protocol\DataType;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
@@ -37,13 +36,11 @@ final class ConnectPacket implements PacketInterface
     {
         $offset = 0;
 
-        // Variable header
         $protocolName = DataType::decodeUtf8String($data, $offset);
         $protocolLevel = DataType::decodeByte($data, $offset);
         $connectFlags = DataType::decodeByte($data, $offset);
         $keepAlive = DataType::decodeTwoByteInteger($data, $offset);
 
-        // Parse connect flags
         $reserved = $connectFlags & 0x01;
         if ($reserved !== 0) {
             throw new ProtocolViolationException('CONNECT reserved flag must be 0');
@@ -69,14 +66,12 @@ final class ConnectPacket implements PacketInterface
             throw new ProtocolViolationException('Will QoS must be 0, 1, or 2');
         }
 
-        // MQTT 5.0 properties
         $properties = null;
         $isV5 = ($protocolLevel === ProtocolVersion::V50->value);
         if ($isV5) {
             $properties = PropertyCodec::decode($data, $offset);
         }
 
-        // Payload
         $clientId = DataType::decodeUtf8String($data, $offset);
 
         $willProperties = null;
@@ -124,11 +119,9 @@ final class ConnectPacket implements PacketInterface
     {
         $data = '';
 
-        // Variable header
         $data .= DataType::encodeUtf8String($this->protocolName);
         $data .= DataType::encodeByte($this->protocolLevel);
 
-        // Connect flags
         $flags = 0;
         if ($this->cleanSession) {
             $flags |= 0x02;
@@ -149,12 +142,10 @@ final class ConnectPacket implements PacketInterface
         $data .= DataType::encodeByte($flags);
         $data .= DataType::encodeTwoByteInteger($this->keepAlive);
 
-        // MQTT 5.0 properties
         if ($this->protocolLevel === ProtocolVersion::V50->value) {
             $data .= $this->properties !== null ? PropertyCodec::encode($this->properties) : PropertyCodec::encodeEmpty();
         }
 
-        // Payload
         $data .= DataType::encodeUtf8String($this->clientId);
 
         if ($this->hasWill) {

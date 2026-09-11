@@ -25,8 +25,6 @@ final class SimplePacketsTest extends TestCase
         $this->factory = new PacketFactory();
     }
 
-    // --- CONNACK ---
-
     public function testConnackRoundTrip(): void
     {
         $packet = new ConnackPacket(sessionPresent: true, returnCode: 0);
@@ -48,8 +46,6 @@ final class SimplePacketsTest extends TestCase
         self::assertSame(5, $decoded->returnCode);
     }
 
-    // --- PUBACK ---
-
     public function testPubackRoundTrip(): void
     {
         $packet = new PubackPacket(packetId: 1234);
@@ -60,8 +56,6 @@ final class SimplePacketsTest extends TestCase
         self::assertSame(1234, $decoded->packetId);
     }
 
-    // --- PUBREC ---
-
     public function testPubrecRoundTrip(): void
     {
         $packet = new PubrecPacket(packetId: 5678);
@@ -71,8 +65,6 @@ final class SimplePacketsTest extends TestCase
         self::assertInstanceOf(PubrecPacket::class, $decoded);
         self::assertSame(5678, $decoded->packetId);
     }
-
-    // --- PUBREL ---
 
     public function testPubrelRoundTrip(): void
     {
@@ -92,8 +84,6 @@ final class SimplePacketsTest extends TestCase
         self::assertSame(0x62, ord($raw[0]));
     }
 
-    // --- PUBCOMP ---
-
     public function testPubcompRoundTrip(): void
     {
         $packet = new PubcompPacket(packetId: 42);
@@ -103,8 +93,6 @@ final class SimplePacketsTest extends TestCase
         self::assertInstanceOf(PubcompPacket::class, $decoded);
         self::assertSame(42, $decoded->packetId);
     }
-
-    // --- UNSUBACK ---
 
     public function testUnsubackRoundTrip(): void
     {
