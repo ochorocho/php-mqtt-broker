@@ -128,10 +128,14 @@ final class PacketHandler
             return;
         }
 
-        // Guard against double disconnect handling (e.g., keepalive timer + TCP close)
-        if (!$connection->isConnected()) {
+        // Guard against double disconnect handling (e.g., keepalive timer + TCP close).
+        // This tracks whether teardown has run, not whether the connection is still
+        // accepting packets: a path that marks a connection not-connected and defers the
+        // close must still get its session persisted and its per-client state released.
+        if ($connection->isDisconnectHandled()) {
             return;
         }
+        $connection->markDisconnectHandled();
         $connection->setConnected(false);
 
         // Publish will message if abnormal disconnect
@@ -1101,20 +1105,26 @@ final class PacketHandler
 
         // Separate shared and non-shared subscriptions
         $normalSubs = [];
-        /** @var array<string, list<\PhpMqtt\Broker\Subscription\Subscription>> */
+        /** @var array<string, array{group: string, subs: list<\PhpMqtt\Broker\Subscription\Subscription>}> */
         $sharedGroups = [];
 
         foreach ($subscriptions as $sub) {
             $group = TopicFilter::sharedGroup($sub->topicFilter);
             if ($group !== null) {
-                $sharedGroups[$group][] = $sub;
+                // Same reasoning as $perClient below: a numeric group name would come
+                // back out of the key as an integer, so keep the name in the entry.
+                $sharedGroups[$group]['group'] = $group;
+                $sharedGroups[$group]['subs'][] = $sub;
             } else {
                 $normalSubs[] = $sub;
             }
         }
 
         // Process normal subscriptions: group by client, take max QoS, collect subscription IDs
-        /** @var array<string, array{qos: int, subIds: list<int>, retainAsPublished: bool}> */
+        // The client ID is carried in the entry rather than read back out of the key:
+        // PHP turns a numeric-string key into an integer, so a client ID like "123"
+        // came back as int(123) and only survived because of a cast at the call site.
+        /** @var array<string, array{clientId: string, qos: int, subIds: list<int>, retainAsPublished: bool}> */
         $perClient = [];
         foreach ($normalSubs as $sub) {
             // noLocal filtering: skip delivery to the publishing client
@@ -1125,6 +1135,7 @@ final class PacketHandler
             $effectiveQoS = min($packet->qos, $sub->qos);
             if (!isset($perClient[$sub->clientId])) {
                 $perClient[$sub->clientId] = [
+                    'clientId' => $sub->clientId,
                     'qos' => $effectiveQoS,
                     'subIds' => [],
                     'retainAsPublished' => $sub->retainAsPublished,
@@ -1142,9 +1153,9 @@ final class PacketHandler
             }
         }
 
-        foreach ($perClient as $clientId => $info) {
+        foreach ($perClient as $info) {
             $this->deliverToClient(
-                (string) $clientId,
+                $info['clientId'],
                 $packet,
                 $info['qos'],
                 $info['subIds'],
@@ -1153,11 +1164,13 @@ final class PacketHandler
         }
 
         // Process shared subscriptions: pick one subscriber per group (round-robin)
-        foreach ($sharedGroups as $groupName => $groupSubs) {
+        foreach ($sharedGroups as $group) {
+            $groupName = $group['group'];
+
             // noLocal applies here too: the publisher must not receive its own message
             // through a shared subscription either (MQTT-3.8.3-3).
             $groupSubs = array_values(array_filter(
-                $groupSubs,
+                $group['subs'],
                 static fn($sub): bool => !($sub->noLocal && $sub->clientId === $publisherClientId),
             ));
 

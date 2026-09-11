@@ -47,6 +47,7 @@ final class Connection
     private ?TimerInterface $willDelayTimer = null;
     private bool $assignedClientId = false;
     private ?TimerInterface $connectTimer = null;
+    private bool $disconnectHandled = false;
 
     public function __construct(
         private readonly ConnectionStream $stream,
@@ -113,6 +114,24 @@ final class Connection
     public function setConnected(bool $connected): void
     {
         $this->connected = $connected;
+    }
+
+    /**
+     * Whether disconnect bookkeeping has already run for this connection.
+     *
+     * This is deliberately separate from isConnected(). A connection can stop being
+     * "connected" — refusing further packets — while its will, session and per-client
+     * state still need to be dealt with once the socket actually closes. Guarding the
+     * teardown on isConnected() meant those paths skipped cleanup entirely.
+     */
+    public function isDisconnectHandled(): bool
+    {
+        return $this->disconnectHandled;
+    }
+
+    public function markDisconnectHandled(): void
+    {
+        $this->disconnectHandled = true;
     }
 
     public function getKeepAlive(): int
