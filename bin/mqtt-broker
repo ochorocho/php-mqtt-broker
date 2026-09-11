@@ -5,6 +5,9 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
+use PhpMqtt\Broker\Auth\AuthenticatorInterface;
+use PhpMqtt\Broker\Auth\AuthenticatorLoader;
+use PhpMqtt\Broker\Auth\PasswordFileAuthenticator;
 use PhpMqtt\Broker\Broker;
 use PhpMqtt\Broker\Configuration;
 
@@ -16,9 +19,71 @@ $options = getopt('', [
     'tls-passphrase:',
     'tls-client-ca:',
     'tls-require-client-cert',
+    'password-file:',
+    'auth:',
+    'allow-any-client-id',
+    'help',
 ]);
 
 $str = static fn(string $name): ?string => is_string($options[$name] ?? null) ? $options[$name] : null;
+$flag = static fn(string $name): bool => array_key_exists($name, $options);
+
+if ($flag('help')) {
+    echo <<<USAGE
+    Usage: mqtt-broker [options]
+
+    Listener:
+      --host=ADDR              Bind address (default 0.0.0.0)
+      --port=PORT              Bind port (default 1883, or 8883 with --tls-cert)
+
+    Authentication (optional; without either flag the broker accepts anyone):
+      --password-file=PATH     Authenticate against a file of hashed credentials.
+                               Write it with bin/mqtt-passwd.
+      --auth=PATH              Load a PHP file returning an AuthenticatorInterface,
+                               for database, LDAP or per-topic rules. The file runs
+                               with the broker's privileges: it must be owned by the
+                               operator and not writable by the broker user.
+      --allow-any-client-id    With --password-file, stop requiring a client ID to
+                               belong to the account that authenticated. Only for
+                               clients whose ID is unrelated to their username.
+
+    TLS:
+      --tls-cert=PATH          Server certificate (enables TLS)
+      --tls-key=PATH           Private key
+      --tls-passphrase=SECRET  Passphrase for an encrypted key
+      --tls-require-client-cert  Require and verify a client certificate
+      --tls-client-ca=PATH     CA bundle used to verify client certificates
+
+      --help                   Show this message
+
+    Credentials travel in clear text on a plaintext listener, so prefer TLS
+    whenever clients authenticate with a username and password.
+
+    USAGE;
+    exit(0);
+}
+
+$passwordFile = $str('password-file');
+$authFile = $str('auth');
+
+// Silently letting one win would let an operator believe their password file is
+// enforced when a custom authenticator has replaced it.
+if ($passwordFile !== null && $authFile !== null) {
+    fwrite(STDERR, "--password-file and --auth are mutually exclusive\n");
+    exit(1);
+}
+
+// --allow-any-client-id configures the password-file authenticator; a custom one
+// owns its own client-ID policy.
+if ($flag('allow-any-client-id') && $authFile !== null) {
+    fwrite(STDERR, "--allow-any-client-id cannot be combined with --auth\n");
+    exit(1);
+}
+
+if ($flag('allow-any-client-id') && $passwordFile === null) {
+    fwrite(STDERR, "--allow-any-client-id requires --password-file\n");
+    exit(1);
+}
 
 $tlsCert = $str('tls-cert');
 
@@ -28,7 +93,7 @@ $config = new Configuration(
     tlsCertPath: $tlsCert,
     tlsKeyPath: $str('tls-key'),
     tlsKeyPassphrase: $str('tls-passphrase'),
-    tlsRequireClientCert: array_key_exists('tls-require-client-cert', $options),
+    tlsRequireClientCert: $flag('tls-require-client-cert'),
     tlsClientCaPath: $str('tls-client-ca'),
 );
 
@@ -44,7 +109,30 @@ $logger = new class extends \Psr\Log\AbstractLogger {
     }
 };
 
-$broker = new Broker(config: $config, logger: $logger);
+try {
+    // Build the authenticator and check the TLS material before announcing a
+    // listener, so a typo'd path cannot print "listening" and then die.
+    $authenticator = null;
+    if ($passwordFile !== null) {
+        $authenticator = PasswordFileAuthenticator::fromFile(
+            path: $passwordFile,
+            bindClientIdToUsername: !$flag('allow-any-client-id'),
+        );
+    } elseif ($authFile !== null) {
+        $authenticator = AuthenticatorLoader::load($authFile);
+    }
+
+    $config->validateTls();
+} catch (RuntimeException $e) {
+    fwrite(STDERR, 'Failed to start: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+
+assert($authenticator === null || $authenticator instanceof AuthenticatorInterface);
+
+// Passing null keeps Broker's own default, so one place decides that an
+// unconfigured broker accepts anyone.
+$broker = new Broker(config: $config, authenticator: $authenticator, logger: $logger);
 
 if (function_exists('pcntl_async_signals')) {
     pcntl_async_signals(true);
@@ -53,10 +141,15 @@ if (function_exists('pcntl_async_signals')) {
 }
 
 echo sprintf(
-    "MQTT Broker listening on %s:%d%s\n",
+    "MQTT Broker listening on %s:%d%s (%s)\n",
     $config->host,
     $config->port,
     $config->isTlsEnabled() ? ($config->tlsRequireClientCert ? ' (TLS, client cert required)' : ' (TLS)') : '',
+    match (true) {
+        $passwordFile !== null => 'password file: ' . $passwordFile,
+        $authFile !== null => 'authenticator: ' . $authFile,
+        default => 'no authentication',
+    },
 );
 
 try {
