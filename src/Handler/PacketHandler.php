@@ -281,7 +281,11 @@ final class PacketHandler
             'authenticate',
             $clientId,
         )) {
-            $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x05));
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50 ? 0x86 : 0x05,
+                protocolVersion: $version,
+            ));
             $connection->close();
             return;
         }

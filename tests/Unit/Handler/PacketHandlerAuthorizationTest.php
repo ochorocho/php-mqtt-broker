@@ -28,6 +28,18 @@ final class PacketHandlerAuthorizationTest extends PacketHandlerTestCase
         self::assertSame(0x05, $this->lastSent($connection, ConnackPacket::class)->returnCode);
     }
 
+    public function testRejectedCredentialsGetBadUserNameOrPasswordOnV50(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(authenticateResult: false));
+
+        $connection = $this->connect('nobody', version: ProtocolVersion::V50, username: 'wrong');
+
+        // 0x05 means "Unspecified error" in 5.0, so a client told only that cannot
+        // distinguish bad credentials from a broker fault. 0x86 says which it was.
+        self::assertFalse($connection->isConnected());
+        self::assertSame(0x86, $this->lastSent($connection, ConnackPacket::class)->returnCode);
+    }
+
     public function testDeniedPublishNeverReachesSubscribersOrRetainedStore(): void
     {
         $this->makeHandler(new RecordingAuthenticator(deniedPublishTopics: ['secret/data']));
