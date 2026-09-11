@@ -143,14 +143,14 @@ final class ConnectPacket implements PacketInterface
         $data .= DataType::encodeTwoByteInteger($this->keepAlive);
 
         if ($this->protocolLevel === ProtocolVersion::V50->value) {
-            $data .= $this->properties !== null ? PropertyCodec::encode($this->properties) : PropertyCodec::encodeEmpty();
+            $data .= PropertyCodec::encodeOrEmpty($this->properties);
         }
 
         $data .= DataType::encodeUtf8String($this->clientId);
 
         if ($this->hasWill) {
             if ($this->protocolLevel === ProtocolVersion::V50->value) {
-                $data .= $this->willProperties !== null ? PropertyCodec::encode($this->willProperties) : PropertyCodec::encodeEmpty();
+                $data .= PropertyCodec::encodeOrEmpty($this->willProperties);
             }
             $data .= DataType::encodeUtf8String($this->willTopic ?? '');
             $data .= DataType::encodeBinaryData($this->willPayload ?? '');

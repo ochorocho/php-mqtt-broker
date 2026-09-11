@@ -50,7 +50,7 @@ final class Connection
         private readonly ConnectionStream $stream,
         private readonly PacketEncoder $encoder,
         private readonly LoopInterface $loop,
-        int $maxPacketSize = 1048576,
+        int $maxPacketSize = PacketStream::DEFAULT_MAX_PACKET_SIZE,
     ) {
         $this->packetStream = new PacketStream($maxPacketSize);
         $this->lastActivity = microtime(true);

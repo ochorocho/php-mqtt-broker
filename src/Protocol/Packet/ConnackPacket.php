@@ -44,7 +44,7 @@ final class ConnackPacket implements PacketInterface
         $flags = $this->sessionPresent ? 0x01 : 0x00;
         $data = DataType::encodeByte($flags) . DataType::encodeByte($this->returnCode);
         if ($this->protocolVersion === ProtocolVersion::V50) {
-            $data .= $this->properties !== null ? PropertyCodec::encode($this->properties) : PropertyCodec::encodeEmpty();
+            $data .= PropertyCodec::encodeOrEmpty($this->properties);
         }
         return $data;
     }

@@ -47,7 +47,6 @@ final class PacketHandler
     private const int SERVER_RECEIVE_MAXIMUM = 20;
     private const int SERVER_TOPIC_ALIAS_MAXIMUM = 10;
     private const int SERVER_KEEP_ALIVE = 60;
-    private const int SERVER_MAXIMUM_PACKET_SIZE = 1048576;
     private const int MAX_SHARED_SUB_COUNTERS = 10000;
 
     private readonly RetainedMessageStore $retainedMessages;
@@ -436,7 +435,7 @@ final class PacketHandler
             $connackProps = new PropertyCollection();
             $connackProps->set(PropertyId::ReceiveMaximum, self::SERVER_RECEIVE_MAXIMUM);
             $connackProps->set(PropertyId::TopicAliasMaximum, self::SERVER_TOPIC_ALIAS_MAXIMUM);
-            $connackProps->set(PropertyId::MaximumPacketSize, self::SERVER_MAXIMUM_PACKET_SIZE);
+            $connackProps->set(PropertyId::MaximumPacketSize, $this->config->maxPacketSize);
             if ($overrideKeepAlive) {
                 $connackProps->set(PropertyId::ServerKeepAlive, self::SERVER_KEEP_ALIVE);
             }
