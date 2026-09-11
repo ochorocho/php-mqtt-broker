@@ -19,9 +19,9 @@ final class ReactPhpServer implements ServerInterface
         $this->loop = $loop ?? Loop::get();
     }
 
-    public function listen(string $uri, callable $onConnection): void
+    public function listen(string $uri, callable $onConnection, array $context = []): void
     {
-        $this->socket = new SocketServer($uri, [], $this->loop);
+        $this->socket = new SocketServer($uri, $context, $this->loop);
 
         $this->socket->on('connection', function (ReactConnection $conn) use ($onConnection): void {
             $onConnection(new ReactPhpConnectionStream($conn));

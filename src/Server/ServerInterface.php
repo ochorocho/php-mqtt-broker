@@ -8,8 +8,9 @@ interface ServerInterface
 {
     /**
      * @param callable(ConnectionStream): void $onConnection
+     * @param array<string, mixed> $context Stream context, e.g. TLS certificate options.
      */
-    public function listen(string $uri, callable $onConnection): void;
+    public function listen(string $uri, callable $onConnection, array $context = []): void;
 
     public function stop(): void;
 

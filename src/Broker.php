@@ -56,12 +56,24 @@ final class Broker
 
     public function start(): void
     {
-        $uri = $this->config->getListenUri();
-        $this->logger->info('MQTT Broker starting on {uri}', ['uri' => $uri]);
+        // Refuse to start rather than bind a TLS listener that cannot complete a
+        // handshake; a broker that silently serves nobody is worse than one that stops.
+        $this->config->validateTls();
 
-        $this->server->listen($uri, function (ConnectionStream $stream): void {
-            $this->onConnection($stream);
-        });
+        $uri = $this->config->getListenUri();
+        $this->logger->info('MQTT Broker starting on {uri}', [
+            'uri' => $uri,
+            'tls' => $this->config->isTlsEnabled(),
+            'mutualTls' => $this->config->tlsRequireClientCert,
+        ]);
+
+        $this->server->listen(
+            $uri,
+            function (ConnectionStream $stream): void {
+                $this->onConnection($stream);
+            },
+            $this->config->getSocketContext(),
+        );
 
         // Expiry used to be evaluated only when a session was looked up, so sessions
         // nobody asked for again were never reclaimed. Sweep them on a timer instead.
