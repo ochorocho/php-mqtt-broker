@@ -32,16 +32,37 @@ final class TopicMatcher
     public function unsubscribe(string $topicFilter, string $clientId): void
     {
         $levels = explode('/', $topicFilter);
-        $node = &$this->root;
+        $this->unsubscribeRecursive($this->root, $levels, 0, $clientId);
+    }
 
-        foreach ($levels as $level) {
-            if (!isset($node['children'][$level])) {
-                return;
-            }
-            $node = &$node['children'][$level];
+    /**
+     * Remove the subscription and prune any node left empty on the way back up.
+     *
+     * Without pruning the trie only ever grows: a client can subscribe to unlimited
+     * distinct deep filters, disconnect, and leave the skeleton behind permanently.
+     *
+     * @param array<string, mixed> $node
+     * @param string[] $levels
+     * @return bool True when this node is now empty and its parent may drop it.
+     */
+    private function unsubscribeRecursive(array &$node, array $levels, int $depth, string $clientId): bool
+    {
+        if ($depth === count($levels)) {
+            unset($node['subscriptions'][$clientId]);
+
+            return $node['subscriptions'] === [] && $node['children'] === [];
         }
 
-        unset($node['subscriptions'][$clientId]);
+        $level = $levels[$depth];
+        if (!isset($node['children'][$level]) || !is_array($node['children'][$level])) {
+            return $node['subscriptions'] === [] && $node['children'] === [];
+        }
+
+        if ($this->unsubscribeRecursive($node['children'][$level], $levels, $depth + 1, $clientId)) {
+            unset($node['children'][$level]);
+        }
+
+        return $node['subscriptions'] === [] && $node['children'] === [];
     }
 
     /**

@@ -56,8 +56,18 @@ final class SubscriptionManager
 
     public function removeClient(string $clientId): void
     {
-        $this->topicMatcher->removeClient($clientId);
+        // Walk only this client's own filters. The previous full-trie scan made every
+        // disconnect cost O(entire trie), so a large trie slowed down all clients.
+        foreach (array_keys($this->clientSubscriptions[$clientId] ?? []) as $topicFilter) {
+            $this->topicMatcher->unsubscribe(self::getMatchFilter($topicFilter), $clientId);
+        }
+
         unset($this->clientSubscriptions[$clientId]);
+    }
+
+    public function countClientSubscriptions(string $clientId): int
+    {
+        return count($this->clientSubscriptions[$clientId] ?? []);
     }
 
     /**

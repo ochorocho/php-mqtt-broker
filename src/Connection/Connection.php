@@ -46,13 +46,15 @@ final class Connection
     private int $unackedOutgoing = 0;
     private ?TimerInterface $willDelayTimer = null;
     private bool $assignedClientId = false;
+    private ?TimerInterface $connectTimer = null;
 
     public function __construct(
         private readonly ConnectionStream $stream,
         private readonly PacketEncoder $encoder,
         private readonly LoopInterface $loop,
+        int $maxPacketSize = 1048576,
     ) {
-        $this->packetStream = new PacketStream();
+        $this->packetStream = new PacketStream($maxPacketSize);
         $this->lastActivity = microtime(true);
     }
 
@@ -79,6 +81,7 @@ final class Connection
     public function close(): void
     {
         $this->cancelKeepAliveTimer();
+        $this->cancelConnectTimer();
         $this->stream->close();
     }
 
@@ -140,6 +143,32 @@ final class Connection
     public function updateActivity(): void
     {
         $this->lastActivity = microtime(true);
+    }
+
+    /**
+     * Arm the deadline by which this connection must send CONNECT.
+     *
+     * Until CONNECT arrives the peer is unauthenticated but still consumes a
+     * connection slot, so without a deadline an idle socket can be held forever.
+     */
+    public function startConnectTimer(float $timeout, callable $onTimeout): void
+    {
+        $this->connectTimer = $this->loop->addTimer($timeout, function () use ($onTimeout): void {
+            $this->connectTimer = null;
+            try {
+                $onTimeout($this);
+            } catch (\Throwable) {
+                $this->stream->close();
+            }
+        });
+    }
+
+    public function cancelConnectTimer(): void
+    {
+        if ($this->connectTimer !== null) {
+            $this->loop->cancelTimer($this->connectTimer);
+            $this->connectTimer = null;
+        }
     }
 
     public function startKeepAliveTimer(callable $onTimeout): void

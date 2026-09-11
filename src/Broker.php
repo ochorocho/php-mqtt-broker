@@ -50,6 +50,7 @@ final class Broker
             packetEncoder: $this->packetEncoder,
             logger: $this->logger,
             eventDispatcher: $this->eventDispatcher,
+            config: $this->config,
         );
     }
 
@@ -60,6 +61,22 @@ final class Broker
 
         $this->server->listen($uri, function (ConnectionStream $stream): void {
             $this->onConnection($stream);
+        });
+
+        // Expiry used to be evaluated only when a session was looked up, so sessions
+        // nobody asked for again were never reclaimed. Sweep them on a timer instead.
+        $this->server->getLoop()->addPeriodicTimer(60.0, function (): void {
+            try {
+                $reaped = $this->packetHandler->getSessionManager()->reapExpired();
+                if ($reaped > 0) {
+                    $this->logger->debug('Reaped {count} expired session(s)', ['count' => $reaped]);
+                }
+            } catch (\Throwable $e) {
+                $this->logger->error('Session reaper failed: {error}', [
+                    'error' => $e->getMessage(),
+                    'exception' => $e,
+                ]);
+            }
         });
 
         $this->running = true;
@@ -102,12 +119,29 @@ final class Broker
             return;
         }
 
-        $connection = new Connection($stream, $this->packetEncoder, $this->server->getLoop());
+        $connection = new Connection(
+            $stream,
+            $this->packetEncoder,
+            $this->server->getLoop(),
+            $this->config->maxPacketSize,
+        );
         $this->connectionManager->add($connection);
 
         $this->logger->debug('New TCP connection from {address}', [
             'address' => $stream->getRemoteAddress(),
         ]);
+
+        // Drop the connection if CONNECT never arrives. Otherwise an unauthenticated
+        // peer can hold a slot indefinitely and exhaust maxConnections for free.
+        $connection->startConnectTimer(
+            $this->config->connectTimeout,
+            function (Connection $conn): void {
+                $this->logger->debug('CONNECT timeout from {address}', [
+                    'address' => $conn->getRemoteAddress(),
+                ]);
+                $conn->close();
+            },
+        );
 
         $stream->onData(function (string $data) use ($connection): void {
             $this->onData($connection, $data);

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Handler;
 
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
+use PhpMqtt\Broker\Configuration;
 use PhpMqtt\Broker\Connection\Connection;
 use PhpMqtt\Broker\Connection\ConnectionManager;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
@@ -42,6 +43,7 @@ final class PacketHandler
     private const int SERVER_TOPIC_ALIAS_MAXIMUM = 10;
     private const int SERVER_KEEP_ALIVE = 60;
     private const int SERVER_MAXIMUM_PACKET_SIZE = 1048576;
+    private const int MAX_SHARED_SUB_COUNTERS = 10000;
 
     private readonly RetainedMessageStore $retainedMessages;
     private readonly SessionManager $sessionManager;
@@ -72,9 +74,13 @@ final class PacketHandler
         private readonly PacketEncoder $packetEncoder,
         private readonly LoggerInterface $logger = new NullLogger(),
         private readonly ?EventDispatcherInterface $eventDispatcher = null,
+        private readonly Configuration $config = new Configuration(),
     ) {
-        $this->retainedMessages = new RetainedMessageStore();
-        $this->sessionManager = new SessionManager();
+        $this->retainedMessages = new RetainedMessageStore(
+            maxMessages: $this->config->maxRetainedMessages,
+            maxBytes: $this->config->maxRetainedBytes,
+        );
+        $this->sessionManager = new SessionManager(maxSessions: $this->config->maxSessions);
     }
 
     public function getRetainedMessages(): RetainedMessageStore
@@ -182,12 +188,16 @@ final class PacketHandler
             // Subscriptions deliberately stay in the routing table while the client is
             // offline: that is what lets messages be queued into the session for
             // delivery on reconnect. They are re-authorized by handleConnect instead.
-            // MQTT 3.1.1 sessions with cleanSession=false persist indefinitely (no time-based expiry).
-            // Use PHP_INT_MAX to prevent SessionManager::get() from expiring them.
+            // MQTT 3.1.1 has no session expiry of its own, so such sessions were pinned
+            // to PHP_INT_MAX and became immortal — an unbounded leak. Bound every session
+            // by the configured ceiling instead.
             if ($connection->getProtocolVersion() === ProtocolVersion::V50) {
-                $session->sessionExpiryInterval = $connection->getSessionExpiryInterval();
+                $session->sessionExpiryInterval = min(
+                    $connection->getSessionExpiryInterval(),
+                    $this->config->maxSessionExpiry,
+                );
             } else {
-                $session->sessionExpiryInterval = PHP_INT_MAX;
+                $session->sessionExpiryInterval = $this->config->maxSessionExpiry;
             }
             $session->disconnectedAt = microtime(true);
             $session->protocolVersion = $connection->getProtocolVersion();
@@ -196,7 +206,7 @@ final class PacketHandler
             // so they can be redelivered on reconnect
             if (isset($this->pendingOutgoing[$clientId])) {
                 foreach ($this->pendingOutgoing[$clientId] as $pendingPacket) {
-                    $session->pendingMessages[] = $pendingPacket;
+                    $this->queuePendingMessage($session, $pendingPacket);
                 }
             }
 
@@ -210,6 +220,9 @@ final class PacketHandler
         if (!$packet instanceof ConnectPacket) {
             throw new ProtocolViolationException('Expected CONNECT packet');
         }
+
+        // CONNECT has arrived; the pre-auth deadline no longer applies.
+        $connection->cancelConnectTimer();
 
         // Validate protocol
         if ($packet->protocolName !== 'MQTT') {
@@ -226,6 +239,18 @@ final class PacketHandler
         }
 
         $connection->setProtocolVersion($version);
+
+        // A client ID becomes a key in the session store, the subscription table and
+        // several per-client maps, so an oversized one is cheap memory amplification.
+        if (strlen($packet->clientId) > $this->config->maxClientIdLength) {
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50 ? 0x85 : 0x02,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
 
         // Generate client ID if empty
         $clientId = $packet->clientId;
@@ -342,6 +367,13 @@ final class PacketHandler
         if ($version === ProtocolVersion::V50 && $packet->keepAlive > self::SERVER_KEEP_ALIVE) {
             $effectiveKeepAlive = self::SERVER_KEEP_ALIVE;
             $overrideKeepAlive = true;
+        }
+
+        // Keep alive 0 disables the timer entirely, leaving a connection that is never
+        // reaped. Apply a floor so every connection stays subject to a liveness check.
+        if ($effectiveKeepAlive === 0) {
+            $effectiveKeepAlive = $this->config->minKeepAlive;
+            $overrideKeepAlive = $version === ProtocolVersion::V50;
         }
         $connection->setKeepAlive($effectiveKeepAlive);
 
@@ -715,6 +747,21 @@ final class PacketHandler
             $retainAsPublished = $sub['retainAsPublished'] ?? false;
             $retainHandling = $sub['retainHandling'] ?? 0;
 
+            // Bound trie growth: deep filters and unlimited subscriptions per client are
+            // both cheap ways to allocate nodes that used to be kept for the process life.
+            if (substr_count($topic, '/') + 1 > $this->config->maxTopicLevels) {
+                $returnCodes[] = 0x80; // Failure
+                continue;
+            }
+
+            if (!$this->subscriptionManager->hasSubscription($clientId, $topic)
+                && $this->subscriptionManager->countClientSubscriptions($clientId)
+                    >= $this->config->maxSubscriptionsPerClient
+            ) {
+                $returnCodes[] = 0x80; // Failure
+                continue;
+            }
+
             if (!$this->authorize(
                 fn(): bool => $this->authenticator->canSubscribe($clientId, $topic),
                 'canSubscribe',
@@ -880,6 +927,27 @@ final class PacketHandler
         }
 
         $connection->close();
+    }
+
+    /**
+     * Append to a session's offline queue, dropping the oldest message when full.
+     *
+     * The queue is otherwise unbounded: a subscriber with a persistent session can go
+     * offline while a publisher floods its topic, and every message is held forever.
+     */
+    private function queuePendingMessage(\PhpMqtt\Broker\Session\Session $session, PublishPacket $packet): void
+    {
+        $limit = $this->config->maxPendingMessagesPerSession;
+
+        if (count($session->pendingMessages) >= $limit) {
+            array_shift($session->pendingMessages);
+            $this->logger->warning('Offline queue full for {clientId}, dropped oldest message', [
+                'clientId' => $session->clientId,
+                'limit' => $limit,
+            ]);
+        }
+
+        $session->pendingMessages[] = $packet;
     }
 
     /**
@@ -1058,6 +1126,12 @@ final class PacketHandler
 
             $key = $groupName . ':' . $groupSubs[0]->topicFilter;
             if (!isset($this->sharedSubCounters[$key])) {
+                // Keys are attacker-chosen ($share/<group>/<filter>) and are not tied to
+                // any client, so they cannot be cleaned up per disconnect. Bound the map
+                // itself; resetting round-robin position is harmless.
+                if (count($this->sharedSubCounters) >= self::MAX_SHARED_SUB_COUNTERS) {
+                    $this->sharedSubCounters = [];
+                }
                 $this->sharedSubCounters[$key] = 0;
             }
             $index = $this->sharedSubCounters[$key] % count($groupSubs);
@@ -1159,7 +1233,7 @@ final class PacketHandler
                 if ($session === null) {
                     $session = $this->sessionManager->getOrCreate($clientId);
                 }
-                $session->pendingMessages[] = $deliverPacket;
+                $this->queuePendingMessage($session, $deliverPacket);
                 return;
             }
 
@@ -1172,7 +1246,7 @@ final class PacketHandler
             // Queue for offline persistent session
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
-                $session->pendingMessages[] = $deliverPacket;
+                $this->queuePendingMessage($session, $deliverPacket);
             }
         }
     }
