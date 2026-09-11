@@ -773,67 +773,14 @@ final class PacketHandler
             );
             $returnCodes[] = $qos; // Granted QoS
 
-            // Determine the actual topic filter for retained message matching
-            // (strip $share/group/ prefix for shared subscriptions)
-            $retainedMatchTopic = TopicFilter::stripSharedPrefix($topic);
-
-            $shouldSendRetained = true;
-            if ($version === ProtocolVersion::V50) {
-                if ($retainHandling === 2) {
-                    $shouldSendRetained = false;
-                } elseif ($retainHandling === 1 && $existingSubscription) {
-                    $shouldSendRetained = false;
-                }
-            }
-
-            if (!$shouldSendRetained) {
-                continue;
-            }
-
-            $retained = $this->retainedMessages->getMatching($retainedMatchTopic);
-            foreach ($retained as $retainedPacket) {
-                $deliverQoS = min($retainedPacket->qos, $qos);
-                $packetId = $deliverQoS > 0 ? $this->inFlight->allocatePacketId($clientId) : null;
-
-                $retainedProps = null;
-                if ($version === ProtocolVersion::V50) {
-                    $retainedProps = new PropertyCollection();
-
-                    if ($retainedPacket->properties !== null) {
-                        $this->forwardProperties($retainedPacket->properties, $retainedProps);
-                    }
-
-                    if ($subscriptionIdentifier > 0) {
-                        $retainedProps->set(PropertyId::SubscriptionIdentifier, $subscriptionIdentifier);
-                    }
-                }
-
-                $deliverPacket = new PublishPacket(
-                    topicName: $retainedPacket->topicName,
-                    payload: $retainedPacket->payload,
-                    qos: $deliverQoS,
-                    retain: true,
-                    packetId: $packetId,
-                    protocolVersion: $version,
-                    properties: $retainedProps,
+            if ($this->shouldSendRetained($version, $retainHandling, $existingSubscription)) {
+                $this->deliverRetainedMessages(
+                    $connection,
+                    $clientId,
+                    TopicFilter::stripSharedPrefix($topic),
+                    $qos,
+                    $subscriptionIdentifier,
                 );
-
-                // Retained delivery bypassed the checks the normal delivery path applies.
-                // Honour the client's maximum packet size (MQTT-3.1.2-24) rather than
-                // sending something it told us it cannot accept.
-                if ($version === ProtocolVersion::V50 && $connection->getClientMaximumPacketSize() > 0
-                    && strlen($this->packetEncoder->encode($deliverPacket)) > $connection->getClientMaximumPacketSize()
-                ) {
-                    continue;
-                }
-
-                // Respect the flow-control window; queue instead of sending past it.
-                if ($deliverQoS > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
-                    $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
-                    continue;
-                }
-
-                $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
             }
         }
 
@@ -842,6 +789,96 @@ final class PacketHandler
             returnCodes: $returnCodes,
             protocolVersion: $version,
         ));
+    }
+
+    /**
+     * Retain Handling lets a 5.0 client ask for the retained messages to be withheld,
+     * either always or when it was already subscribed (MQTT-3.8.3.1). 3.1.1 always
+     * sends them.
+     */
+    private function shouldSendRetained(ProtocolVersion $version, int $retainHandling, bool $alreadySubscribed): bool
+    {
+        if ($version !== ProtocolVersion::V50) {
+            return true;
+        }
+
+        return match ($retainHandling) {
+            2 => false,
+            1 => !$alreadySubscribed,
+            default => true,
+        };
+    }
+
+    /**
+     * Send the retained messages matching a new subscription.
+     *
+     * This path is subject to the same limits as ordinary delivery: it used to bypass
+     * both the client's maximum packet size and the flow-control window.
+     */
+    private function deliverRetainedMessages(
+        Connection $connection,
+        string $clientId,
+        string $topicFilter,
+        int $subscribedQoS,
+        int $subscriptionIdentifier,
+    ): void {
+        $version = $connection->getProtocolVersion();
+
+        foreach ($this->retainedMessages->getMatching($topicFilter) as $retainedPacket) {
+            $qos = min($retainedPacket->qos, $subscribedQoS);
+
+            $properties = null;
+            if ($version === ProtocolVersion::V50) {
+                $properties = new PropertyCollection();
+
+                if ($retainedPacket->properties !== null) {
+                    $this->forwardProperties($retainedPacket->properties, $properties);
+                }
+
+                if ($subscriptionIdentifier > 0) {
+                    $properties->set(PropertyId::SubscriptionIdentifier, $subscriptionIdentifier);
+                }
+            }
+
+            $deliverPacket = new PublishPacket(
+                topicName: $retainedPacket->topicName,
+                payload: $retainedPacket->payload,
+                qos: $qos,
+                retain: true,
+                packetId: $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null,
+                protocolVersion: $version,
+                properties: $properties,
+            );
+
+            if ($this->exceedsClientPacketSize($connection, $deliverPacket)) {
+                continue;
+            }
+
+            // Respect the flow-control window; queue instead of sending past it.
+            if ($qos > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
+                $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
+                continue;
+            }
+
+            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
+        }
+    }
+
+    /**
+     * A 5.0 client may declare a maximum packet size it will accept (MQTT-3.1.2-24).
+     *
+     * Only for retained delivery, where the connection is live and its version is the
+     * one to trust. deliverToClient has its own check for a reason; see there.
+     */
+    private function exceedsClientPacketSize(Connection $connection, PublishPacket $packet): bool
+    {
+        if ($connection->getProtocolVersion() !== ProtocolVersion::V50) {
+            return false;
+        }
+
+        $maximum = $connection->getClientMaximumPacketSize();
+
+        return $maximum > 0 && strlen($this->packetEncoder->encode($packet)) > $maximum;
     }
 
     private function handleUnsubscribe(Connection $connection, PacketInterface $packet): void
@@ -1213,6 +1250,9 @@ final class PacketHandler
             properties: $properties,
         );
 
+        // Deliberately not exceedsClientPacketSize(): this path keys on $version, which
+        // for an offline client comes from the saved session rather than the connection.
+        // The two look like the same check and are not.
         if ($version === ProtocolVersion::V50 && $connection !== null && $connection->getClientMaximumPacketSize() > 0) {
             $encoded = $this->packetEncoder->encode($deliverPacket);
             if (strlen($encoded) > $connection->getClientMaximumPacketSize()) {
