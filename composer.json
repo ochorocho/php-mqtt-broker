@@ -4,6 +4,9 @@
   "type": "library",
   "license": "MIT",
   "minimum-stability": "stable",
+  "bin": [
+    "bin/mqtt-broker"
+  ],
   "require": {
     "php": "^8.3",
     "react/socket": "^1.15",
