@@ -168,6 +168,10 @@ final class PacketHandler
             $subscriptions = array_values($this->subscriptionManager->getClientSubscriptions($clientId));
             $session = $this->sessionManager->getOrCreate($clientId);
             $session->subscriptions = $subscriptions;
+
+            // Subscriptions deliberately stay in the routing table while the client is
+            // offline: that is what lets messages be queued into the session for
+            // delivery on reconnect. They are re-authorized by handleConnect instead.
             // MQTT 3.1.1 sessions with cleanSession=false persist indefinitely (no time-based expiry).
             // Use PHP_INT_MAX to prevent SessionManager::get() from expiring them.
             if ($connection->getProtocolVersion() === ProtocolVersion::V50) {
@@ -232,6 +236,33 @@ final class PacketHandler
         // Authenticate
         if (!$this->authenticator->authenticate($clientId, $packet->username, $packet->password)) {
             $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x05));
+            $connection->close();
+            return;
+        }
+
+        // Bind the client ID to the authenticated principal before any takeover.
+        // Without this, valid credentials allow evicting another client and, for
+        // persistent sessions, inheriting its subscriptions and queued messages.
+        if (!$this->authenticator->canUseClientId($clientId, $packet->username)) {
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
+        // Reject a will the client is not allowed to publish, rather than accepting
+        // it at CONNECT and silently dropping it at disconnect time.
+        if ($packet->hasWill && $packet->willTopic !== null
+            && !$this->authenticator->canPublish($clientId, $packet->willTopic)
+        ) {
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
+                protocolVersion: $version,
+            ));
             $connection->close();
             return;
         }
@@ -312,7 +343,16 @@ final class PacketHandler
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
                 $sessionPresent = true;
-                // Restore subscriptions
+                // Re-authorize restored subscriptions: a grant made before the client's
+                // access was revoked must not survive a reconnect. The subscriptions are
+                // still live in the routing table (they stay there while offline so
+                // messages can be queued), so clear them first and re-add only the ones
+                // the authenticator still permits.
+                $session->subscriptions = array_values(array_filter(
+                    $session->subscriptions,
+                    fn($sub): bool => $this->authenticator->canSubscribe($clientId, $sub->topicFilter),
+                ));
+                $this->subscriptionManager->removeClient($clientId);
                 $this->subscriptionManager->restoreClientSubscriptions($clientId, $session->subscriptions);
             }
         }
@@ -473,6 +513,14 @@ final class PacketHandler
                 });
                 return;
             }
+        }
+
+        // Authorize the publish before it reaches the retained store or any subscriber.
+        // An empty retained payload deletes the retained message for a topic, so this
+        // also gates retained-message destruction.
+        if (!$this->authenticator->canPublish($clientId, $packet->topicName)) {
+            $this->rejectPublish($connection, $packet);
+            return;
         }
 
         // Handle retained messages
@@ -774,12 +822,56 @@ final class PacketHandler
         $connection->close();
     }
 
+    /**
+     * Acknowledge a denied PUBLISH without routing it.
+     *
+     * MQTT 5.0 has a "Not authorized" reason code; 3.1.1 has no way to signal refusal,
+     * so the packet is acknowledged normally and silently dropped, per spec guidance.
+     */
+    private function rejectPublish(Connection $connection, PublishPacket $packet): void
+    {
+        $version = $connection->getProtocolVersion();
+        $isV5 = $version === ProtocolVersion::V50;
+
+        $this->logger->warning('Publish denied for {clientId} on {topic}', [
+            'clientId' => $connection->getClientId(),
+            'topic' => $packet->topicName,
+        ]);
+
+        if ($packet->qos === 1 && $packet->packetId !== null) {
+            $connection->send(new PubackPacket(
+                packetId: $packet->packetId,
+                protocolVersion: $version,
+                reasonCode: $isV5 ? 0x87 : 0x00,
+            ));
+        }
+
+        if ($packet->qos === 2 && $packet->packetId !== null) {
+            $connection->send(new PubrecPacket(
+                packetId: $packet->packetId,
+                protocolVersion: $version,
+                reasonCode: $isV5 ? 0x87 : 0x00,
+            ));
+        }
+    }
+
     private function publishWillMessage(Connection $connection): void
     {
         $willTopic = $connection->getWillTopic();
         $willPayload = $connection->getWillPayload();
 
         if ($willTopic === null) {
+            return;
+        }
+
+        // Re-check at publish time: authorization may have been revoked while the
+        // connection was open, or between a delayed will being armed and firing.
+        $clientId = $connection->getClientId();
+        if ($clientId !== null && !$this->authenticator->canPublish($clientId, $willTopic)) {
+            $this->logger->warning('Will message denied for {clientId} on {topic}', [
+                'clientId' => $clientId,
+                'topic' => $willTopic,
+            ]);
             return;
         }
 

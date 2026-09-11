@@ -78,6 +78,18 @@ class MyAuthenticator implements AuthenticatorInterface
     {
         return true;
     }
+
+    /**
+     * Bind the client ID to the authenticated user.
+     *
+     * Connecting with another client's ID evicts that client and, for persistent
+     * sessions, inherits its subscriptions and queued messages — so returning
+     * `true` unconditionally here lets any valid account hijack any other.
+     */
+    public function canUseClientId(string $clientId, ?string $username): bool
+    {
+        return $clientId === $username . '-device';
+    }
 }
 
 $broker = new Broker(
