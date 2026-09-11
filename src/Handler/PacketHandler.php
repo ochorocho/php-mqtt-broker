@@ -144,7 +144,17 @@ final class PacketHandler
             if ($willDelayInterval > 0 && $sessionExpiry > 0) {
                 $effectiveDelay = min($willDelayInterval, $sessionExpiry);
                 $this->willDelayTimers[$clientId] = $this->loop->addTimer($effectiveDelay, function () use ($connection, $clientId): void {
-                    $this->publishWillMessage($connection);
+                    // Runs long after the client is gone and outside any request-path
+                    // guard; publishWillMessage encodes packets and can throw.
+                    try {
+                        $this->publishWillMessage($connection);
+                    } catch (\Throwable $e) {
+                        $this->logger->error('Delayed will publication failed for {clientId}: {error}', [
+                            'clientId' => $clientId,
+                            'error' => $e->getMessage(),
+                            'exception' => $e,
+                        ]);
+                    }
                     $connection->clearWill();
                     unset($this->willDelayTimers[$clientId]);
                 });
@@ -197,7 +207,9 @@ final class PacketHandler
 
     private function handleConnect(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof ConnectPacket);
+        if (!$packet instanceof ConnectPacket) {
+            throw new ProtocolViolationException('Expected CONNECT packet');
+        }
 
         // Validate protocol
         if ($packet->protocolName !== 'MQTT') {
@@ -234,7 +246,11 @@ final class PacketHandler
         }
 
         // Authenticate
-        if (!$this->authenticator->authenticate($clientId, $packet->username, $packet->password)) {
+        if (!$this->authorize(
+            fn(): bool => $this->authenticator->authenticate($clientId, $packet->username, $packet->password),
+            'authenticate',
+            $clientId,
+        )) {
             $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x05));
             $connection->close();
             return;
@@ -243,7 +259,11 @@ final class PacketHandler
         // Bind the client ID to the authenticated principal before any takeover.
         // Without this, valid credentials allow evicting another client and, for
         // persistent sessions, inheriting its subscriptions and queued messages.
-        if (!$this->authenticator->canUseClientId($clientId, $packet->username)) {
+        if (!$this->authorize(
+            fn(): bool => $this->authenticator->canUseClientId($clientId, $packet->username),
+            'canUseClientId',
+            $clientId,
+        )) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
                 returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
@@ -256,7 +276,12 @@ final class PacketHandler
         // Reject a will the client is not allowed to publish, rather than accepting
         // it at CONNECT and silently dropping it at disconnect time.
         if ($packet->hasWill && $packet->willTopic !== null
-            && !$this->authenticator->canPublish($clientId, $packet->willTopic)
+            && !$this->authorize(
+                fn(): bool => $this->authenticator->canPublish($clientId, $packet->willTopic ?? ''),
+                'canPublish(will)',
+                $clientId,
+                $packet->willTopic,
+            )
         ) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
@@ -350,7 +375,12 @@ final class PacketHandler
                 // the authenticator still permits.
                 $session->subscriptions = array_values(array_filter(
                     $session->subscriptions,
-                    fn($sub): bool => $this->authenticator->canSubscribe($clientId, $sub->topicFilter),
+                    fn($sub): bool => $this->authorize(
+                        fn(): bool => $this->authenticator->canSubscribe($clientId, $sub->topicFilter),
+                        'canSubscribe(restore)',
+                        $clientId,
+                        $sub->topicFilter,
+                    ),
                 ));
                 $this->subscriptionManager->removeClient($clientId);
                 $this->subscriptionManager->restoreClientSubscriptions($clientId, $session->subscriptions);
@@ -445,7 +475,9 @@ final class PacketHandler
 
     private function handlePublish(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof PublishPacket);
+        if (!$packet instanceof PublishPacket) {
+            throw new ProtocolViolationException('Expected PUBLISH packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -509,7 +541,11 @@ final class PacketHandler
                 }
                 // Defer close to allow client to read the DISCONNECT packet
                 $this->loop->addTimer(0.5, function () use ($connection): void {
-                    $connection->close();
+                    try {
+                        $connection->close();
+                    } catch (\Throwable) {
+                        // Nothing useful left to do; never let it reach the event loop.
+                    }
                 });
                 return;
             }
@@ -518,7 +554,12 @@ final class PacketHandler
         // Authorize the publish before it reaches the retained store or any subscriber.
         // An empty retained payload deletes the retained message for a topic, so this
         // also gates retained-message destruction.
-        if (!$this->authenticator->canPublish($clientId, $packet->topicName)) {
+        if (!$this->authorize(
+            fn(): bool => $this->authenticator->canPublish($clientId, $packet->topicName),
+            'canPublish',
+            $clientId,
+            $packet->topicName,
+        )) {
             $this->rejectPublish($connection, $packet);
             return;
         }
@@ -559,7 +600,9 @@ final class PacketHandler
 
     private function handlePuback(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof PubackPacket);
+        if (!$packet instanceof PubackPacket) {
+            throw new ProtocolViolationException('Expected PUBACK packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -572,7 +615,9 @@ final class PacketHandler
 
     private function handlePubrec(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof PubrecPacket);
+        if (!$packet instanceof PubrecPacket) {
+            throw new ProtocolViolationException('Expected PUBREC packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -590,7 +635,9 @@ final class PacketHandler
 
     private function handlePubrel(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof PubrelPacket);
+        if (!$packet instanceof PubrelPacket) {
+            throw new ProtocolViolationException('Expected PUBREL packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -625,7 +672,9 @@ final class PacketHandler
 
     private function handlePubcomp(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof PubcompPacket);
+        if (!$packet instanceof PubcompPacket) {
+            throw new ProtocolViolationException('Expected PUBCOMP packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -638,7 +687,9 @@ final class PacketHandler
 
     private function handleSubscribe(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof SubscribePacket);
+        if (!$packet instanceof SubscribePacket) {
+            throw new ProtocolViolationException('Expected SUBSCRIBE packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -664,7 +715,12 @@ final class PacketHandler
             $retainAsPublished = $sub['retainAsPublished'] ?? false;
             $retainHandling = $sub['retainHandling'] ?? 0;
 
-            if (!$this->authenticator->canSubscribe($clientId, $topic)) {
+            if (!$this->authorize(
+                fn(): bool => $this->authenticator->canSubscribe($clientId, $topic),
+                'canSubscribe',
+                $clientId,
+                $topic,
+            )) {
                 $returnCodes[] = 0x80; // Failure
                 continue;
             }
@@ -754,7 +810,9 @@ final class PacketHandler
 
     private function handleUnsubscribe(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof UnsubscribePacket);
+        if (!$packet instanceof UnsubscribePacket) {
+            throw new ProtocolViolationException('Expected UNSUBSCRIBE packet');
+        }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
             return;
@@ -799,7 +857,9 @@ final class PacketHandler
 
     private function handleDisconnectPacket(Connection $connection, PacketInterface $packet): void
     {
-        assert($packet instanceof DisconnectPacket);
+        if (!$packet instanceof DisconnectPacket) {
+            throw new ProtocolViolationException('Expected DISCONNECT packet');
+        }
 
         // MQTT 5.0: check for SessionExpiryInterval override in DISCONNECT properties
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->properties !== null) {
@@ -820,6 +880,32 @@ final class PacketHandler
         }
 
         $connection->close();
+    }
+
+    /**
+     * Run an authorization check, failing closed if the authenticator throws.
+     *
+     * Implementations typically hit a database or HTTP service, so a transient error
+     * is expected. Such an error must neither grant access nor escape into the event
+     * loop, where it would stop the broker for every connected client.
+     *
+     * @param callable(): bool $check
+     */
+    private function authorize(callable $check, string $action, string $clientId, string $topic = ''): bool
+    {
+        try {
+            return $check();
+        } catch (\Throwable $e) {
+            $this->logger->error('Authenticator failed during {action} for {clientId}, denying: {error}', [
+                'action' => $action,
+                'clientId' => $clientId,
+                'topic' => $topic,
+                'error' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+
+            return false;
+        }
     }
 
     /**
@@ -867,7 +953,12 @@ final class PacketHandler
         // Re-check at publish time: authorization may have been revoked while the
         // connection was open, or between a delayed will being armed and firing.
         $clientId = $connection->getClientId();
-        if ($clientId !== null && !$this->authenticator->canPublish($clientId, $willTopic)) {
+        if ($clientId !== null && !$this->authorize(
+            fn(): bool => $this->authenticator->canPublish($clientId, $willTopic),
+            'canPublish(will)',
+            $clientId,
+            $willTopic,
+        )) {
             $this->logger->warning('Will message denied for {clientId} on {topic}', [
                 'clientId' => $clientId,
                 'topic' => $willTopic,

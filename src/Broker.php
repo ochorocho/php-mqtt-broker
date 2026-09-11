@@ -141,12 +141,33 @@ final class Broker
             if ($connection->isConnected() || $connection->getClientId() === null) {
                 $connection->close();
             }
+        } catch (\Throwable $e) {
+            // The broker is a single process with one event loop: anything escaping here
+            // would reach $loop->run() and drop every connected client. Contain the
+            // failure to the connection that caused it.
+            $this->logger->error('Unexpected error handling data from {client}: {error}', [
+                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
+                'error' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+            $connection->close();
         }
     }
 
     private function onClose(Connection $connection): void
     {
-        $this->packetHandler->handleDisconnect($connection, false);
+        // handleDisconnect publishes will messages and encodes packets, either of which
+        // can throw. This runs from the socket's close callback, outside onData's guard.
+        try {
+            $this->packetHandler->handleDisconnect($connection, false);
+        } catch (\Throwable $e) {
+            $this->logger->error('Error during disconnect of {client}: {error}', [
+                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
+                'error' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+        }
+
         $this->connectionManager->remove($connection);
 
         $this->logger->debug('Connection closed: {client}', [

@@ -156,7 +156,14 @@ final class Connection
         $this->keepAliveTimer = $this->loop->addPeriodicTimer($timeout / 3, function () use ($onTimeout, $timeout): void {
             $elapsed = microtime(true) - $this->lastActivity;
             if ($elapsed >= $timeout) {
-                $onTimeout($this);
+                // Timer callbacks run outside every request-path try/catch; an exception
+                // here would escape the event loop and stop the whole broker.
+                try {
+                    $onTimeout($this);
+                } catch (\Throwable) {
+                    $this->cancelKeepAliveTimer();
+                    $this->stream->close();
+                }
             }
         });
     }
