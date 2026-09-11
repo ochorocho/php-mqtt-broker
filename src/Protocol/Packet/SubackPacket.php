@@ -12,7 +12,8 @@ use PhpMqtt\Broker\Protocol\ProtocolVersion;
 final class SubackPacket implements PacketInterface
 {
     /**
-     * @param int[] $returnCodes QoS 0 (0x00), QoS 1 (0x01), QoS 2 (0x02), or Failure (0x80)
+     * @param int[] $returnCodes One per topic filter, as SubackReasonCode values:
+     *                           the granted QoS, or a failure code.
      */
     public function __construct(
         public readonly int $packetId,

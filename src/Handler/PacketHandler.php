@@ -28,7 +28,11 @@ use PhpMqtt\Broker\Protocol\Packet\UnsubscribePacket;
 use PhpMqtt\Broker\Protocol\PacketEncoder;
 use PhpMqtt\Broker\Protocol\Property\PropertyCollection;
 use PhpMqtt\Broker\Protocol\Property\PropertyId;
+use PhpMqtt\Broker\Protocol\ConnectReasonCode;
+use PhpMqtt\Broker\Protocol\DisconnectReasonCode;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
+use PhpMqtt\Broker\Protocol\PubackReasonCode;
+use PhpMqtt\Broker\Protocol\SubackReasonCode;
 use PhpMqtt\Broker\Protocol\TopicFilter;
 use PhpMqtt\Broker\Session\SessionManager;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
@@ -230,7 +234,10 @@ final class PacketHandler
 
         $version = ProtocolVersion::tryFrom($packet->protocolLevel);
         if ($version === null) {
-            $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x01));
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: ConnectReasonCode::UnacceptableProtocolVersion->value,
+            ));
             $connection->close();
             return;
         }
@@ -242,7 +249,9 @@ final class PacketHandler
         if (strlen($packet->clientId) > $this->config->maxClientIdLength) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x85 : 0x02,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::ClientIdentifierNotValid->value
+                    : ConnectReasonCode::IdentifierRejected->value,
                 protocolVersion: $version,
             ));
             $connection->close();
@@ -258,7 +267,10 @@ final class PacketHandler
             } else {
                 // MQTT 3.1.1: empty client ID requires clean session
                 if (!$packet->cleanSession) {
-                    $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x02));
+                    $connection->send(new ConnackPacket(
+                        sessionPresent: false,
+                        returnCode: ConnectReasonCode::IdentifierRejected->value,
+                    ));
                     $connection->close();
                     return;
                 }
@@ -271,7 +283,10 @@ final class PacketHandler
             'authenticate',
             $clientId,
         )) {
-            $connection->send(new ConnackPacket(sessionPresent: false, returnCode: 0x05));
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: ConnectReasonCode::NotAuthorizedV311->value,
+            ));
             $connection->close();
             return;
         }
@@ -286,7 +301,9 @@ final class PacketHandler
         )) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::NotAuthorized->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
                 protocolVersion: $version,
             ));
             $connection->close();
@@ -305,7 +322,9 @@ final class PacketHandler
         ) {
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
-                returnCode: $version === ProtocolVersion::V50 ? 0x87 : 0x05,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::NotAuthorized->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
                 protocolVersion: $version,
             ));
             $connection->close();
@@ -432,7 +451,7 @@ final class PacketHandler
 
         $connection->send(new ConnackPacket(
             sessionPresent: $sessionPresent,
-            returnCode: 0x00,
+            returnCode: ConnectReasonCode::Success->value,
             protocolVersion: $version,
             properties: $connackProps,
         ));
@@ -503,10 +522,9 @@ final class PacketHandler
             if ($topicAlias !== null) {
                 $alias = (int) $topicAlias;
                 if ($alias === 0 || $alias > self::SERVER_TOPIC_ALIAS_MAXIMUM) {
-                    // Topic Alias invalid — send DISCONNECT 0x94
                     $connection->send(new DisconnectPacket(
                         protocolVersion: ProtocolVersion::V50,
-                        reasonCode: 0x94,
+                        reasonCode: DisconnectReasonCode::TopicAliasInvalid->value,
                     ));
                     $connection->close();
                     return;
@@ -520,7 +538,7 @@ final class PacketHandler
                         // Alias not yet established — protocol error
                         $connection->send(new DisconnectPacket(
                             protocolVersion: ProtocolVersion::V50,
-                            reasonCode: 0x94,
+                            reasonCode: DisconnectReasonCode::TopicAliasInvalid->value,
                         ));
                         $connection->close();
                         return;
@@ -546,7 +564,7 @@ final class PacketHandler
                 if ($connection->getProtocolVersion() === ProtocolVersion::V50) {
                     $connection->send(new DisconnectPacket(
                         protocolVersion: ProtocolVersion::V50,
-                        reasonCode: 0x93,
+                        reasonCode: DisconnectReasonCode::ReceiveMaximumExceeded->value,
                     ));
                 }
                 // Defer close to allow client to read the DISCONNECT packet
@@ -731,14 +749,14 @@ final class PacketHandler
             // A malformed filter used to be accepted and granted, leaving the client
             // believing it had subscribed to something the broker stored as a literal.
             if (!TopicFilter::isValidFilter($topic) || !TopicFilter::isValidSharedFilter($topic)) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
             // Bound trie growth: deep filters and unlimited subscriptions per client are
             // both cheap ways to allocate nodes that used to be kept for the process life.
             if (substr_count($topic, '/') + 1 > $this->config->maxTopicLevels) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
@@ -746,7 +764,7 @@ final class PacketHandler
                 && $this->subscriptionManager->countClientSubscriptions($clientId)
                     >= $this->config->maxSubscriptionsPerClient
             ) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
@@ -756,7 +774,7 @@ final class PacketHandler
                 $clientId,
                 $topic,
             )) {
-                $returnCodes[] = 0x80; // Failure
+                $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
 
@@ -867,9 +885,9 @@ final class PacketHandler
             foreach ($packet->topicFilters as $filter) {
                 if ($this->subscriptionManager->hasSubscription($clientId, $filter)) {
                     $this->subscriptionManager->unsubscribe($clientId, $filter);
-                    $reasonCodes[] = 0x00; // Success
+                    $reasonCodes[] = SubackReasonCode::GrantedQos0->value;
                 } else {
-                    $reasonCodes[] = 0x11; // No subscription existed
+                    $reasonCodes[] = SubackReasonCode::NoSubscriptionExisted->value;
                 }
             }
 
@@ -910,8 +928,8 @@ final class PacketHandler
             }
         }
 
-        // MQTT 5.0 reason code 0x04 = Disconnect with Will Message
-        if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->reasonCode === 0x04) {
+        // The client is asking for its will to be published despite going away cleanly.
+        if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->reasonCode === DisconnectReasonCode::DisconnectWithWillMessage->value) {
             // Will should still be published despite clean disconnect
             $this->handleDisconnect($connection, false);
         } else {
@@ -990,7 +1008,7 @@ final class PacketHandler
             $connection->send(new PubackPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? 0x87 : 0x00,
+                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
             ));
         }
 
@@ -998,7 +1016,7 @@ final class PacketHandler
             $connection->send(new PubrecPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? 0x87 : 0x00,
+                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
             ));
         }
     }
