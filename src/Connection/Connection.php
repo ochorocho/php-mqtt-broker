@@ -24,7 +24,6 @@ final class Connection
     private int $keepAlive = 0;
     private bool $cleanSession = true;
 
-    // Will message
     private bool $hasWill = false;
     private ?string $willTopic = null;
     private ?string $willPayload = null;
@@ -32,7 +31,6 @@ final class Connection
     private bool $willRetain = false;
     private ?PropertyCollection $willProperties = null;
 
-    // MQTT 5.0 state
     private int $sessionExpiryInterval = 0;
     private int $receiveMaximum = 65535;
     private int $clientMaximumPacketSize = 0;
@@ -44,7 +42,6 @@ final class Connection
     private array $outgoingTopicAliases = [];
     private int $nextOutgoingTopicAlias = 1;
     private int $unackedOutgoing = 0;
-    private ?TimerInterface $willDelayTimer = null;
     private bool $assignedClientId = false;
     private ?TimerInterface $connectTimer = null;
     private bool $disconnectHandled = false;
@@ -53,7 +50,7 @@ final class Connection
         private readonly ConnectionStream $stream,
         private readonly PacketEncoder $encoder,
         private readonly LoopInterface $loop,
-        int $maxPacketSize = 1048576,
+        int $maxPacketSize = PacketStream::DEFAULT_MAX_PACKET_SIZE,
     ) {
         $this->packetStream = new PacketStream($maxPacketSize);
         $this->lastActivity = microtime(true);
@@ -72,11 +69,6 @@ final class Connection
     public function send(PacketInterface $packet): void
     {
         $this->stream->write($this->encoder->encode($packet));
-    }
-
-    public function sendRaw(string $data): void
-    {
-        $this->stream->write($data);
     }
 
     public function close(): void
@@ -224,8 +216,6 @@ final class Connection
         }
     }
 
-    // Will message accessors
-
     public function hasWill(): bool
     {
         return $this->hasWill;
@@ -274,13 +264,6 @@ final class Connection
     public function getWillProperties(): ?PropertyCollection
     {
         return $this->willProperties;
-    }
-
-    // MQTT 5.0 accessors
-
-    public function getLoop(): LoopInterface
-    {
-        return $this->loop;
     }
 
     public function getSessionExpiryInterval(): int
@@ -376,24 +359,6 @@ final class Connection
     {
         if ($this->unackedOutgoing > 0) {
             $this->unackedOutgoing--;
-        }
-    }
-
-    public function getWillDelayTimer(): ?TimerInterface
-    {
-        return $this->willDelayTimer;
-    }
-
-    public function setWillDelayTimer(?TimerInterface $timer): void
-    {
-        $this->willDelayTimer = $timer;
-    }
-
-    public function cancelWillDelayTimer(): void
-    {
-        if ($this->willDelayTimer !== null) {
-            $this->loop->cancelTimer($this->willDelayTimer);
-            $this->willDelayTimer = null;
         }
     }
 

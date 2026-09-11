@@ -78,11 +78,6 @@ final class TopicMatcher
         return $results->getAll();
     }
 
-    public function removeClient(string $clientId): void
-    {
-        $this->removeClientRecursive($this->root, $clientId);
-    }
-
     /**
      * @param array<string, mixed> $node
      * @param string[] $levels
@@ -126,19 +121,4 @@ final class TopicMatcher
         }
     }
 
-    /**
-     * @param array<string, mixed> $node
-     */
-    private function removeClientRecursive(array &$node, string $clientId): void
-    {
-        unset($node['subscriptions'][$clientId]);
-
-        if (isset($node['children']) && is_array($node['children'])) {
-            foreach ($node['children'] as &$child) {
-                if (is_array($child)) {
-                    $this->removeClientRecursive($child, $clientId);
-                }
-            }
-        }
-    }
 }

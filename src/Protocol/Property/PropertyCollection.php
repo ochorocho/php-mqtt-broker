@@ -23,11 +23,6 @@ final class PropertyCollection
         return $this->properties[$id->value] ?? null;
     }
 
-    public function has(PropertyId $id): bool
-    {
-        return isset($this->properties[$id->value]);
-    }
-
     public function remove(PropertyId $id): void
     {
         unset($this->properties[$id->value]);

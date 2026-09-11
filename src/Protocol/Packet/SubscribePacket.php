@@ -94,7 +94,7 @@ final class SubscribePacket implements PacketInterface
         $data = DataType::encodeTwoByteInteger($this->packetId);
 
         if ($this->protocolVersion === ProtocolVersion::V50) {
-            $data .= $this->properties !== null ? PropertyCodec::encode($this->properties) : PropertyCodec::encodeEmpty();
+            $data .= PropertyCodec::encodeOrEmpty($this->properties);
         }
 
         foreach ($this->subscriptions as $sub) {

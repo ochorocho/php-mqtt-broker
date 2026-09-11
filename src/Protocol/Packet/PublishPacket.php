@@ -92,7 +92,7 @@ final class PublishPacket implements PacketInterface
         }
 
         if ($this->protocolVersion === ProtocolVersion::V50) {
-            $data .= $this->properties !== null ? PropertyCodec::encode($this->properties) : PropertyCodec::encodeEmpty();
+            $data .= PropertyCodec::encodeOrEmpty($this->properties);
         }
 
         $data .= $this->payload;

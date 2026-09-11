@@ -36,7 +36,7 @@ final class AuthPacket implements PacketInterface
     public function encode(): string
     {
         $data = DataType::encodeByte($this->reasonCode);
-        $data .= $this->properties !== null ? PropertyCodec::encode($this->properties) : PropertyCodec::encodeEmpty();
+        $data .= PropertyCodec::encodeOrEmpty($this->properties);
         return $data;
     }
 

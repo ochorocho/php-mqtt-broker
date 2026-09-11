@@ -8,6 +8,11 @@ use PhpMqtt\Broker\Exception\MalformedPacketException;
 
 final class PacketStream
 {
+    public const int DEFAULT_MAX_PACKET_SIZE = 1024 * 1024;
+
+    /** A fifth continuation byte would exceed the remaining length range. */
+    private const int VARIABLE_BYTE_INT_MAX_MULTIPLIER = 128 * 128 * 128;
+
     private string $buffer = '';
 
     /**
@@ -17,7 +22,7 @@ final class PacketStream
      *                           the buffer grows until the process runs out of memory.
      */
     public function __construct(
-        private readonly int $maxPacketSize = 1048576,
+        private readonly int $maxPacketSize = self::DEFAULT_MAX_PACKET_SIZE,
     ) {
     }
 
@@ -35,33 +40,45 @@ final class PacketStream
 
     public function hasCompletePacket(): bool
     {
-        $length = strlen($this->buffer);
-        if ($length < 2) {
+        $size = $this->totalPacketSize();
+        if ($size === null) {
             return false;
         }
 
-        // Parse remaining length starting at byte index 1
+        return strlen($this->buffer) >= $size;
+    }
+
+    /**
+     * Size of the packet at the head of the buffer, or null while the fixed header is
+     * still incomplete.
+     */
+    private function totalPacketSize(): ?int
+    {
+        $length = strlen($this->buffer);
+        if ($length < 2) {
+            return null;
+        }
+
         $offset = 1;
         $multiplier = 1;
         $remainingLength = 0;
 
         do {
             if ($offset >= $length) {
-                return false; // Need more data for remaining length
+                return null;
             }
 
             $byte = ord($this->buffer[$offset]);
             $remainingLength += ($byte & 0x7F) * $multiplier;
             $offset++;
 
-            if ($multiplier > 128 * 128 * 128) {
+            if ($multiplier > self::VARIABLE_BYTE_INT_MAX_MULTIPLIER) {
                 throw new MalformedPacketException('Malformed remaining length');
             }
 
             $multiplier *= 128;
         } while (($byte & 0x80) !== 0);
 
-        // Total packet size = fixed header byte + remaining length bytes + remaining length value
         $totalSize = $offset + $remainingLength;
 
         // Reject an oversized packet as soon as its declared length is known, rather
@@ -74,30 +91,18 @@ final class PacketStream
             ));
         }
 
-        return $length >= $totalSize;
+        return $totalSize;
     }
 
     public function nextPacket(): string
     {
-        if (!$this->hasCompletePacket()) {
+        $totalSize = $this->totalPacketSize();
+        $length = strlen($this->buffer);
+
+        if ($totalSize === null || $length < $totalSize) {
             throw new MalformedPacketException('No complete packet in buffer');
         }
 
-        $length = strlen($this->buffer);
-
-        // Parse remaining length again to determine packet boundaries
-        $offset = 1;
-        $multiplier = 1;
-        $remainingLength = 0;
-
-        do {
-            $byte = ord($this->buffer[$offset]);
-            $remainingLength += ($byte & 0x7F) * $multiplier;
-            $offset++;
-            $multiplier *= 128;
-        } while (($byte & 0x80) !== 0);
-
-        $totalSize = $offset + $remainingLength;
         $packet = substr($this->buffer, 0, $totalSize);
 
         if ($totalSize >= $length) {
