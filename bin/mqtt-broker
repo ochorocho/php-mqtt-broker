@@ -11,11 +11,25 @@ use PhpMqtt\Broker\Configuration;
 $options = getopt('', [
     'host:',
     'port:',
+    'tls-cert:',
+    'tls-key:',
+    'tls-passphrase:',
+    'tls-client-ca:',
+    'tls-require-client-cert',
 ]);
 
+$str = static fn(string $name): ?string => is_string($options[$name] ?? null) ? $options[$name] : null;
+
+$tlsCert = $str('tls-cert');
+
 $config = new Configuration(
-    host: is_string($options['host'] ?? null) ? $options['host'] : '0.0.0.0',
-    port: (int) ($options['port'] ?? 1883),
+    host: $str('host') ?? '0.0.0.0',
+    port: (int) ($options['port'] ?? ($tlsCert !== null ? 8883 : 1883)),
+    tlsCertPath: $tlsCert,
+    tlsKeyPath: $str('tls-key'),
+    tlsKeyPassphrase: $str('tls-passphrase'),
+    tlsRequireClientCert: array_key_exists('tls-require-client-cert', $options),
+    tlsClientCaPath: $str('tls-client-ca'),
 );
 
 $logger = new class extends \Psr\Log\AbstractLogger {
@@ -38,5 +52,16 @@ if (function_exists('pcntl_async_signals')) {
     pcntl_signal(SIGTERM, static fn() => $broker->stop());
 }
 
-echo sprintf("MQTT Broker listening on %s:%d\n", $config->host, $config->port);
-$broker->start();
+echo sprintf(
+    "MQTT Broker listening on %s:%d%s\n",
+    $config->host,
+    $config->port,
+    $config->isTlsEnabled() ? ($config->tlsRequireClientCert ? ' (TLS, client cert required)' : ' (TLS)') : '',
+);
+
+try {
+    $broker->start();
+} catch (RuntimeException $e) {
+    fwrite(STDERR, 'Failed to start: ' . $e->getMessage() . "\n");
+    exit(1);
+}

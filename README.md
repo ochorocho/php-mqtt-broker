@@ -78,6 +78,18 @@ class MyAuthenticator implements AuthenticatorInterface
     {
         return true;
     }
+
+    /**
+     * Bind the client ID to the authenticated user.
+     *
+     * Connecting with another client's ID evicts that client and, for persistent
+     * sessions, inherits its subscriptions and queued messages — so returning
+     * `true` unconditionally here lets any valid account hijack any other.
+     */
+    public function canUseClientId(string $clientId, ?string $username): bool
+    {
+        return $clientId === $username . '-device';
+    }
 }
 
 $broker = new Broker(
@@ -100,6 +112,37 @@ $config = new Configuration(
 $broker = new Broker(config: $config);
 $broker->start();
 ```
+
+TLS 1.2 is the minimum by default (TLS 1.3 is used when available). `start()`
+throws if the certificate or key cannot be read, rather than binding a listener
+that would fail every handshake.
+
+For mutual TLS, require a client certificate and give the CA bundle to verify
+it against:
+
+```php
+$config = new Configuration(
+    port: 8883,
+    tlsCertPath: '/path/to/server.crt',
+    tlsKeyPath: '/path/to/server.key',
+    tlsKeyPassphrase: 'secret',          // only for an encrypted key
+    tlsRequireClientCert: true,
+    tlsClientCaPath: '/path/to/ca.crt',
+    tlsCiphers: 'ECDHE+AESGCM',          // optional
+);
+```
+
+The CLI accepts the same options:
+
+```bash
+php bin/mqtt-broker --tls-cert=/path/to/server.crt --tls-key=/path/to/server.key
+php bin/mqtt-broker --tls-cert=server.crt --tls-key=server.key \
+    --tls-require-client-cert --tls-client-ca=ca.crt
+```
+
+With `--tls-cert` the default port is 8883. Note that MQTT credentials are sent
+in the clear on a plaintext listener, so prefer TLS whenever clients
+authenticate with a username and password.
 
 ### PSR-3 Logging
 

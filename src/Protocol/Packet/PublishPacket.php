@@ -7,6 +7,7 @@ namespace PhpMqtt\Broker\Protocol\Packet;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
 use PhpMqtt\Broker\Protocol\DataType;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
+use PhpMqtt\Broker\Protocol\TopicFilter;
 use PhpMqtt\Broker\Protocol\Property\PropertyCodec;
 use PhpMqtt\Broker\Protocol\Property\PropertyCollection;
 
@@ -28,6 +29,12 @@ final class PublishPacket implements PacketInterface
         if ($qos === 0 && $packetId !== null) {
             throw new ProtocolViolationException('Packet ID must not be set for QoS 0');
         }
+        if ($qos > 0 && $packetId === 0) {
+            throw new ProtocolViolationException('Packet ID must not be zero');
+        }
+        if ($qos === 0 && $dup) {
+            throw new ProtocolViolationException('DUP must be 0 for QoS 0');
+        }
     }
 
     public static function decode(string $data, int $flags, ProtocolVersion $version = ProtocolVersion::V311): self
@@ -42,6 +49,15 @@ final class PublishPacket implements PacketInterface
 
         $offset = 0;
         $topicName = DataType::decodeUtf8String($data, $offset);
+
+        // A published topic is a name, not a filter: wildcards are forbidden. An empty
+        // name is only legal in 5.0 when a topic alias supplies it, which is resolved
+        // by the handler.
+        if ($topicName !== '' && !TopicFilter::isValidName($topicName)) {
+            throw new ProtocolViolationException(
+                sprintf('PUBLISH topic name must not contain wildcards: %s', $topicName),
+            );
+        }
 
         $packetId = null;
         if ($qos > 0) {

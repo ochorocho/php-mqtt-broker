@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Tests\Unit\Protocol;
 
+use PhpMqtt\Broker\Exception\MalformedPacketException;
 use PhpMqtt\Broker\Protocol\PacketStream;
 use PHPUnit\Framework\TestCase;
 
@@ -84,13 +85,41 @@ final class PacketStreamTest extends TestCase
 
     public function testFourByteRemainingLength(): void
     {
-        $stream = new PacketStream();
+        // Sized above the declared length so this exercises the four-byte varint path
+        // rather than the maximum-packet-size guard, which is covered separately below.
+        $stream = new PacketStream(maxPacketSize: 4_194_304);
         // Remaining length 2097152 = 0x80 0x80 0x80 0x01
         // We won't actually create 2MB of payload, just verify detection logic
         // by checking that it needs more data
         $stream->append("\x30\x80\x80\x80\x01");
         // Buffer has 5 bytes, but needs 5 + 2097152 = 2097157
         self::assertFalse($stream->hasCompletePacket());
+    }
+
+    public function testRejectsPacketDeclaringSizeAboveMaximum(): void
+    {
+        $stream = new PacketStream(maxPacketSize: 1024);
+
+        // Declares a remaining length of 2097152, far above the limit. It must be
+        // rejected as soon as the length is known, not buffered toward a size it can
+        // never reach.
+        $stream->append("\x30\x80\x80\x80\x01");
+
+        $this->expectException(MalformedPacketException::class);
+        $stream->hasCompletePacket();
+    }
+
+    public function testRejectsBufferGrowthBeyondMaximum(): void
+    {
+        $stream = new PacketStream(maxPacketSize: 512);
+
+        // A client that streams bytes without ever completing a packet must not be
+        // able to grow the buffer without bound.
+        $this->expectException(MalformedPacketException::class);
+
+        for ($i = 0; $i < 10; $i++) {
+            $stream->append(str_repeat('A', 100));
+        }
     }
 
     public function testFragmentedRemainingLength(): void

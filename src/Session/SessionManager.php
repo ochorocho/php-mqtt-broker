@@ -9,6 +9,65 @@ final class SessionManager
     /** @var array<string, Session> */
     private array $sessions = [];
 
+    public function __construct(
+        private readonly int $maxSessions = 10000,
+    ) {
+    }
+
+    /**
+     * Drop every session whose expiry has passed.
+     *
+     * Expiry was previously only evaluated inside get(), so a session nobody ever
+     * looked up again was never reclaimed: connect with a fresh client ID, disconnect,
+     * repeat, and the broker leaked until it ran out of memory. Call this periodically.
+     *
+     * @return int Number of sessions reaped.
+     */
+    public function reapExpired(): int
+    {
+        $now = microtime(true);
+        $reaped = 0;
+
+        foreach ($this->sessions as $clientId => $session) {
+            if ($session->disconnectedAt <= 0.0) {
+                continue;
+            }
+
+            if ($now - $session->disconnectedAt >= $session->sessionExpiryInterval) {
+                unset($this->sessions[$clientId]);
+                $reaped++;
+            }
+        }
+
+        return $reaped;
+    }
+
+    public function count(): int
+    {
+        return count($this->sessions);
+    }
+
+    /**
+     * Evict the session idle the longest, so a flood of new client IDs cannot grow
+     * the table without bound between reaper runs.
+     */
+    private function evictOldestDisconnected(): void
+    {
+        $oldestId = null;
+        $oldestAt = INF;
+
+        foreach ($this->sessions as $clientId => $session) {
+            if ($session->disconnectedAt > 0.0 && $session->disconnectedAt < $oldestAt) {
+                $oldestAt = $session->disconnectedAt;
+                $oldestId = $clientId;
+            }
+        }
+
+        if ($oldestId !== null) {
+            unset($this->sessions[$oldestId]);
+        }
+    }
+
     public function get(string $clientId): ?Session
     {
         $session = $this->sessions[$clientId] ?? null;
@@ -34,6 +93,13 @@ final class SessionManager
     public function getOrCreate(string $clientId): Session
     {
         if (!isset($this->sessions[$clientId])) {
+            if (count($this->sessions) >= $this->maxSessions) {
+                $this->reapExpired();
+            }
+            if (count($this->sessions) >= $this->maxSessions) {
+                $this->evictOldestDisconnected();
+            }
+
             $this->sessions[$clientId] = new Session($clientId);
         }
 

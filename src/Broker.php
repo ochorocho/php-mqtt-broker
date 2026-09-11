@@ -50,16 +50,45 @@ final class Broker
             packetEncoder: $this->packetEncoder,
             logger: $this->logger,
             eventDispatcher: $this->eventDispatcher,
+            config: $this->config,
         );
     }
 
     public function start(): void
     {
-        $uri = $this->config->getListenUri();
-        $this->logger->info('MQTT Broker starting on {uri}', ['uri' => $uri]);
+        // Refuse to start rather than bind a TLS listener that cannot complete a
+        // handshake; a broker that silently serves nobody is worse than one that stops.
+        $this->config->validateTls();
 
-        $this->server->listen($uri, function (ConnectionStream $stream): void {
-            $this->onConnection($stream);
+        $uri = $this->config->getListenUri();
+        $this->logger->info('MQTT Broker starting on {uri}', [
+            'uri' => $uri,
+            'tls' => $this->config->isTlsEnabled(),
+            'mutualTls' => $this->config->tlsRequireClientCert,
+        ]);
+
+        $this->server->listen(
+            $uri,
+            function (ConnectionStream $stream): void {
+                $this->onConnection($stream);
+            },
+            $this->config->getSocketContext(),
+        );
+
+        // Expiry used to be evaluated only when a session was looked up, so sessions
+        // nobody asked for again were never reclaimed. Sweep them on a timer instead.
+        $this->server->getLoop()->addPeriodicTimer(60.0, function (): void {
+            try {
+                $reaped = $this->packetHandler->getSessionManager()->reapExpired();
+                if ($reaped > 0) {
+                    $this->logger->debug('Reaped {count} expired session(s)', ['count' => $reaped]);
+                }
+            } catch (\Throwable $e) {
+                $this->logger->error('Session reaper failed: {error}', [
+                    'error' => $e->getMessage(),
+                    'exception' => $e,
+                ]);
+            }
         });
 
         $this->running = true;
@@ -102,12 +131,29 @@ final class Broker
             return;
         }
 
-        $connection = new Connection($stream, $this->packetEncoder, $this->server->getLoop());
+        $connection = new Connection(
+            $stream,
+            $this->packetEncoder,
+            $this->server->getLoop(),
+            $this->config->maxPacketSize,
+        );
         $this->connectionManager->add($connection);
 
         $this->logger->debug('New TCP connection from {address}', [
             'address' => $stream->getRemoteAddress(),
         ]);
+
+        // Drop the connection if CONNECT never arrives. Otherwise an unauthenticated
+        // peer can hold a slot indefinitely and exhaust maxConnections for free.
+        $connection->startConnectTimer(
+            $this->config->connectTimeout,
+            function (Connection $conn): void {
+                $this->logger->debug('CONNECT timeout from {address}', [
+                    'address' => $conn->getRemoteAddress(),
+                ]);
+                $conn->close();
+            },
+        );
 
         $stream->onData(function (string $data) use ($connection): void {
             $this->onData($connection, $data);
@@ -141,12 +187,33 @@ final class Broker
             if ($connection->isConnected() || $connection->getClientId() === null) {
                 $connection->close();
             }
+        } catch (\Throwable $e) {
+            // The broker is a single process with one event loop: anything escaping here
+            // would reach $loop->run() and drop every connected client. Contain the
+            // failure to the connection that caused it.
+            $this->logger->error('Unexpected error handling data from {client}: {error}', [
+                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
+                'error' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+            $connection->close();
         }
     }
 
     private function onClose(Connection $connection): void
     {
-        $this->packetHandler->handleDisconnect($connection, false);
+        // handleDisconnect publishes will messages and encodes packets, either of which
+        // can throw. This runs from the socket's close callback, outside onData's guard.
+        try {
+            $this->packetHandler->handleDisconnect($connection, false);
+        } catch (\Throwable $e) {
+            $this->logger->error('Error during disconnect of {client}: {error}', [
+                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
+                'error' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+        }
+
         $this->connectionManager->remove($connection);
 
         $this->logger->debug('Connection closed: {client}', [

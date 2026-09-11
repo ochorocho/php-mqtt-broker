@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Subscription;
 
+use PhpMqtt\Broker\Protocol\TopicFilter;
+
 final class SubscriptionManager
 {
     private readonly TopicMatcher $topicMatcher;
@@ -56,8 +58,18 @@ final class SubscriptionManager
 
     public function removeClient(string $clientId): void
     {
-        $this->topicMatcher->removeClient($clientId);
+        // Walk only this client's own filters. The previous full-trie scan made every
+        // disconnect cost O(entire trie), so a large trie slowed down all clients.
+        foreach (array_keys($this->clientSubscriptions[$clientId] ?? []) as $topicFilter) {
+            $this->topicMatcher->unsubscribe(self::getMatchFilter($topicFilter), $clientId);
+        }
+
         unset($this->clientSubscriptions[$clientId]);
+    }
+
+    public function countClientSubscriptions(string $clientId): int
+    {
+        return count($this->clientSubscriptions[$clientId] ?? []);
     }
 
     /**
@@ -98,13 +110,6 @@ final class SubscriptionManager
      */
     private static function getMatchFilter(string $topicFilter): string
     {
-        if (str_starts_with($topicFilter, '$share/')) {
-            $parts = explode('/', $topicFilter, 3);
-            if (count($parts) >= 3) {
-                return $parts[2];
-            }
-        }
-
-        return $topicFilter;
+        return TopicFilter::stripSharedPrefix($topicFilter);
     }
 }

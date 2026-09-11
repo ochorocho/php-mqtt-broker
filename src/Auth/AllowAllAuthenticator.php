@@ -31,4 +31,9 @@ final class AllowAllAuthenticator implements AuthenticatorInterface
     {
         return true;
     }
+
+    public function canUseClientId(string $clientId, ?string $username): bool
+    {
+        return true;
+    }
 }

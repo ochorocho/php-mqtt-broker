@@ -10,8 +10,26 @@ final class PacketStream
 {
     private string $buffer = '';
 
+    /**
+     * @param int $maxPacketSize Cap on both a single packet and the buffer itself.
+     *                           Without it a client can declare a remaining length of
+     *                           up to 268 MB, or simply never complete a packet, and
+     *                           the buffer grows until the process runs out of memory.
+     */
+    public function __construct(
+        private readonly int $maxPacketSize = 1048576,
+    ) {
+    }
+
     public function append(string $data): void
     {
+        if (strlen($this->buffer) + strlen($data) > $this->maxPacketSize) {
+            throw new MalformedPacketException(sprintf(
+                'Receive buffer would exceed maximum packet size of %d bytes',
+                $this->maxPacketSize,
+            ));
+        }
+
         $this->buffer .= $data;
     }
 
@@ -45,6 +63,16 @@ final class PacketStream
 
         // Total packet size = fixed header byte + remaining length bytes + remaining length value
         $totalSize = $offset + $remainingLength;
+
+        // Reject an oversized packet as soon as its declared length is known, rather
+        // than buffering toward a limit it can never satisfy.
+        if ($totalSize > $this->maxPacketSize) {
+            throw new MalformedPacketException(sprintf(
+                'Packet size %d exceeds maximum of %d bytes',
+                $totalSize,
+                $this->maxPacketSize,
+            ));
+        }
 
         return $length >= $totalSize;
     }

@@ -20,6 +20,8 @@ final class PropertyCodec
             throw new MalformedPacketException('Property length exceeds available data');
         }
 
+        $seen = [];
+
         while ($offset < $endOffset) {
             $idValue = DataType::decodeVariableByteInteger($data, $offset);
             $id = PropertyId::tryFrom($idValue);
@@ -28,8 +30,33 @@ final class PropertyCodec
                 throw new MalformedPacketException(sprintf('Unknown property ID 0x%02X', $idValue));
             }
 
+            // A property that may appear only once must not be repeated; otherwise the
+            // last write silently wins and the sender chooses which value takes effect.
+            if (!$id->isMultiValue()) {
+                if (isset($seen[$id->value])) {
+                    throw new MalformedPacketException(
+                        sprintf('Duplicate property 0x%02X', $id->value),
+                    );
+                }
+                $seen[$id->value] = true;
+            }
+
             $value = self::decodeValue($id, $data, $offset);
+
+            // The declared property length is a boundary, not a hint. A value allowed to
+            // read past it consumes the bytes of whatever follows, so the sender controls
+            // which properties the broker sees and which it silently skips.
+            if ($offset > $endOffset) {
+                throw new MalformedPacketException(
+                    'Property value overruns the declared property length',
+                );
+            }
+
             $collection->set($id, $value);
+        }
+
+        if ($offset !== $endOffset) {
+            throw new MalformedPacketException('Property length does not match the properties read');
         }
 
         return $collection;

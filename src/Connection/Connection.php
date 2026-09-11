@@ -46,13 +46,16 @@ final class Connection
     private int $unackedOutgoing = 0;
     private ?TimerInterface $willDelayTimer = null;
     private bool $assignedClientId = false;
+    private ?TimerInterface $connectTimer = null;
+    private bool $disconnectHandled = false;
 
     public function __construct(
         private readonly ConnectionStream $stream,
         private readonly PacketEncoder $encoder,
         private readonly LoopInterface $loop,
+        int $maxPacketSize = 1048576,
     ) {
-        $this->packetStream = new PacketStream();
+        $this->packetStream = new PacketStream($maxPacketSize);
         $this->lastActivity = microtime(true);
     }
 
@@ -79,6 +82,7 @@ final class Connection
     public function close(): void
     {
         $this->cancelKeepAliveTimer();
+        $this->cancelConnectTimer();
         $this->stream->close();
     }
 
@@ -112,6 +116,24 @@ final class Connection
         $this->connected = $connected;
     }
 
+    /**
+     * Whether disconnect bookkeeping has already run for this connection.
+     *
+     * This is deliberately separate from isConnected(). A connection can stop being
+     * "connected" — refusing further packets — while its will, session and per-client
+     * state still need to be dealt with once the socket actually closes. Guarding the
+     * teardown on isConnected() meant those paths skipped cleanup entirely.
+     */
+    public function isDisconnectHandled(): bool
+    {
+        return $this->disconnectHandled;
+    }
+
+    public function markDisconnectHandled(): void
+    {
+        $this->disconnectHandled = true;
+    }
+
     public function getKeepAlive(): int
     {
         return $this->keepAlive;
@@ -142,6 +164,32 @@ final class Connection
         $this->lastActivity = microtime(true);
     }
 
+    /**
+     * Arm the deadline by which this connection must send CONNECT.
+     *
+     * Until CONNECT arrives the peer is unauthenticated but still consumes a
+     * connection slot, so without a deadline an idle socket can be held forever.
+     */
+    public function startConnectTimer(float $timeout, callable $onTimeout): void
+    {
+        $this->connectTimer = $this->loop->addTimer($timeout, function () use ($onTimeout): void {
+            $this->connectTimer = null;
+            try {
+                $onTimeout($this);
+            } catch (\Throwable) {
+                $this->stream->close();
+            }
+        });
+    }
+
+    public function cancelConnectTimer(): void
+    {
+        if ($this->connectTimer !== null) {
+            $this->loop->cancelTimer($this->connectTimer);
+            $this->connectTimer = null;
+        }
+    }
+
     public function startKeepAliveTimer(callable $onTimeout): void
     {
         $this->cancelKeepAliveTimer();
@@ -156,7 +204,14 @@ final class Connection
         $this->keepAliveTimer = $this->loop->addPeriodicTimer($timeout / 3, function () use ($onTimeout, $timeout): void {
             $elapsed = microtime(true) - $this->lastActivity;
             if ($elapsed >= $timeout) {
-                $onTimeout($this);
+                // Timer callbacks run outside every request-path try/catch; an exception
+                // here would escape the event loop and stop the whole broker.
+                try {
+                    $onTimeout($this);
+                } catch (\Throwable) {
+                    $this->cancelKeepAliveTimer();
+                    $this->stream->close();
+                }
             }
         });
     }
