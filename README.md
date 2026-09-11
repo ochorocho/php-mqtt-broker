@@ -12,7 +12,7 @@ A pure-PHP MQTT broker supporting MQTT 3.1.1 and 5.0, built on [ReactPHP](https:
 ## Installation
 
 ```bash
-composer require php-mqtt/broker
+composer require ochorocho/php-mqtt-broker
 ```
 
 ## Quick Start
@@ -23,10 +23,12 @@ composer require php-mqtt/broker
 php bin/mqtt-broker
 ```
 
-The broker listens on `0.0.0.0:1883` by default. Options:
+The broker listens on `0.0.0.0:1883` by default and accepts anyone. Options:
 
 ```bash
 php bin/mqtt-broker --host=127.0.0.1 --port=1884
+php bin/mqtt-broker --password-file=/etc/mqtt/passwd   # require credentials
+php bin/mqtt-broker --help                             # every option
 ```
 
 Signal handling (SIGINT/SIGTERM) is supported when the `pcntl` extension is available.
@@ -51,9 +53,81 @@ $broker = new Broker(config: $config);
 $broker->start();
 ```
 
-### Custom Authentication
+### Authentication
 
-Implement `AuthenticatorInterface` to control client access:
+Without an authentication option the broker accepts every client, which is fine
+on a trusted network and wrong anywhere else. There are two ways to change that.
+
+#### Password file
+
+Give each client its own credentials in a file of bcrypt hashes, and point the
+broker at it:
+
+```bash
+php bin/mqtt-passwd /etc/mqtt/passwd sensor01     # prompts twice, echo off
+php bin/mqtt-broker --password-file=/etc/mqtt/passwd
+```
+
+The file holds one `username:hash` per line, like Mosquitto's `passwd`. Write it
+with `bin/mqtt-passwd` — `-b` sets a password without prompting (visible in the
+process list, so prefer the prompt), and `-D` deletes a user.
+
+Three things worth knowing before you deploy it:
+
+- **Client IDs are bound to the account.** `alice` may connect as `alice` or
+  `alice-<anything>`, and nothing else. Without this, any valid account could
+  evict another client and inherit its session. Clients whose ID is unrelated to
+  their username — ESPHome sets `client_id` independently — either need their
+  `client_id` set to match, or the broker started with `--allow-any-client-id`.
+- **There are no per-topic rules.** Every authenticated client may publish and
+  subscribe anywhere. If you need ACLs, use a custom authenticator below.
+- **The file is read once at startup.** Adding or removing a user takes effect on
+  restart.
+
+The broker refuses to start if the file is missing, unreadable, or malformed,
+naming the offending line, rather than starting up and rejecting every client.
+
+#### Custom authenticator
+
+For a database, LDAP, or per-topic rules, implement `AuthenticatorInterface` and
+point the broker at a PHP file that returns one:
+
+```bash
+php bin/mqtt-broker --auth=/etc/mqtt/auth.php
+```
+
+```php
+// /etc/mqtt/auth.php
+return new MyAuthenticator($pdo);
+```
+
+That file is executed with the broker's privileges, so it must be owned by the
+operator and not writable by the user the broker runs as.
+
+#### Configuring clients
+
+> These two snippets are **unverified** — neither project lives in this
+> repository, so treat them as a starting point rather than tested configuration.
+
+ESPHome sends credentials from its `mqtt:` block:
+
+```yaml
+mqtt:
+  broker: 192.168.1.10
+  port: 1883
+  username: sensor01
+  password: !secret mqtt_password
+  client_id: sensor01     # must match the username unless --allow-any-client-id
+```
+
+A client that currently sends no credentials — such as TYPO3
+`EXT:mqtt_client`'s `MqttReader` — has to set the username and password fields
+in its CONNECT packet *and* the matching flag bits (`0x80` and `0x40` in the
+connect flags byte). Most client libraries expose this as a
+`setCredentials($username, $password)` call before connecting. Keep the
+credentials in extension configuration, not in source.
+
+The same interface is available when embedding the broker as a library:
 
 ```php
 <?php
@@ -191,17 +265,19 @@ mosquitto_pub -h localhost -p 1883 -t 'test/topic' -m 'Hello' -V mqttv5
 - Subscription identifiers
 - Message expiry
 - Server Keep Alive
-- Custom authentication and authorization
+- Password-file authentication with hashed credentials (`bin/mqtt-passwd`)
+- Custom authentication and authorization via `AuthenticatorInterface`
 - TLS support
 - PSR-3 logging
 
 ## Development (DDEV)
 
-The project includes a [DDEV](https://ddev.com/) configuration for local development. The MQTT broker starts automatically as a daemon and port 1883 is exposed directly to the host.
+The project includes a [DDEV](https://ddev.com/) configuration for local development. Port 1883 is exposed directly to the host, so host-side `mosquitto_pub`/`mosquitto_sub` reach the containerized broker. The `web_extra_daemons` entry that would start the broker automatically is commented out, so start it yourself.
 
 ```bash
-# Start the environment (broker starts automatically)
+# Start the environment, then the broker
 ddev start
+ddev exec "cd /var/www/html && nohup php bin/mqtt-broker > /tmp/broker.log 2>&1 &"
 
 # Connect from the host
 mosquitto_sub -h localhost -p 1883 -t '#'
