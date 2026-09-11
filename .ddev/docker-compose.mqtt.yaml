@@ -1,4 +1,12 @@
+# Host port 11883, container port 1883.
+#
+# Only one project can hold host 1883 at a time, and ochorocho-website claims it
+# for real ESPHome devices on the LAN. This project is a development broker with
+# no such constraint, so it yields the well-known port and both can run at once.
+#
+# Inside the container the broker still listens on 1883, so nothing in the image
+# or the conformance suite's defaults has to change.
 services:
   web:
     ports:
-      - "1883:1883"
+      - "11883:1883"
