@@ -29,6 +29,7 @@ use PhpMqtt\Broker\Protocol\PacketEncoder;
 use PhpMqtt\Broker\Protocol\Property\PropertyCollection;
 use PhpMqtt\Broker\Protocol\Property\PropertyId;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
+use PhpMqtt\Broker\Protocol\TopicFilter;
 use PhpMqtt\Broker\Session\SessionManager;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
 use PhpMqtt\Broker\Event\MessagePublished;
@@ -734,7 +735,17 @@ final class PacketHandler
         if ($version === ProtocolVersion::V50 && $packet->properties !== null) {
             $subId = $packet->properties->get(PropertyId::SubscriptionIdentifier);
             if ($subId !== null) {
+                // More than one identifier on a SUBSCRIBE is a protocol error, and the
+                // value must be at least 1 (MQTT-3.8.2.1.2).
+                if (is_array($subId) && count($subId) > 1) {
+                    throw new ProtocolViolationException('SUBSCRIBE must carry at most one Subscription Identifier');
+                }
+
                 $subscriptionIdentifier = is_array($subId) ? (int) $subId[0] : (int) $subId;
+
+                if ($subscriptionIdentifier === 0) {
+                    throw new ProtocolViolationException('Subscription Identifier must not be zero');
+                }
             }
         }
 
@@ -746,6 +757,13 @@ final class PacketHandler
             $noLocal = $sub['noLocal'] ?? false;
             $retainAsPublished = $sub['retainAsPublished'] ?? false;
             $retainHandling = $sub['retainHandling'] ?? 0;
+
+            // A malformed filter used to be accepted and granted, leaving the client
+            // believing it had subscribed to something the broker stored as a literal.
+            if (!TopicFilter::isValidFilter($topic) || !TopicFilter::isValidSharedFilter($topic)) {
+                $returnCodes[] = 0x80; // Failure
+                continue;
+            }
 
             // Bound trie growth: deep filters and unlimited subscriptions per client are
             // both cheap ways to allocate nodes that used to be kept for the process life.
@@ -788,13 +806,7 @@ final class PacketHandler
 
             // Determine the actual topic filter for retained message matching
             // (strip $share/group/ prefix for shared subscriptions)
-            $retainedMatchTopic = $topic;
-            if (str_starts_with($topic, '$share/')) {
-                $parts = explode('/', $topic, 3);
-                if (count($parts) >= 3) {
-                    $retainedMatchTopic = $parts[2];
-                }
-            }
+            $retainedMatchTopic = TopicFilter::stripSharedPrefix($topic);
 
             // Determine if retained messages should be sent
             $shouldSendRetained = true;
@@ -841,9 +853,28 @@ final class PacketHandler
                     protocolVersion: $version,
                     properties: $retainedProps,
                 );
+
+                // Retained delivery bypassed the checks the normal delivery path applies.
+                // Honour the client's maximum packet size (MQTT-3.1.2-24) rather than
+                // sending something it told us it cannot accept.
+                if ($version === ProtocolVersion::V50 && $connection->getClientMaximumPacketSize() > 0
+                    && strlen($this->packetEncoder->encode($deliverPacket)) > $connection->getClientMaximumPacketSize()
+                ) {
+                    continue;
+                }
+
+                // Respect the flow-control window; queue instead of sending past it.
+                if ($deliverQoS > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
+                    $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
+                    continue;
+                }
+
                 $connection->send($deliverPacket);
                 if ($deliverQoS > 0 && $deliverPacket->packetId !== null) {
                     $this->pendingOutgoing[$clientId][$deliverPacket->packetId] = $deliverPacket;
+                    // Without this the counter drifts from pendingOutgoing and flow
+                    // control degrades for the rest of the session.
+                    $connection->incrementUnackedOutgoing();
                 }
             }
         }
@@ -1074,10 +1105,9 @@ final class PacketHandler
         $sharedGroups = [];
 
         foreach ($subscriptions as $sub) {
-            if (str_starts_with($sub->topicFilter, '$share/')) {
-                $parts = explode('/', $sub->topicFilter, 3);
-                $groupName = $parts[1] ?? '';
-                $sharedGroups[$groupName][] = $sub;
+            $group = TopicFilter::sharedGroup($sub->topicFilter);
+            if ($group !== null) {
+                $sharedGroups[$group][] = $sub;
             } else {
                 $normalSubs[] = $sub;
             }
@@ -1093,12 +1123,16 @@ final class PacketHandler
             }
 
             $effectiveQoS = min($packet->qos, $sub->qos);
-            if (!isset($perClient[$sub->clientId]) || $effectiveQoS > $perClient[$sub->clientId]['qos']) {
+            if (!isset($perClient[$sub->clientId])) {
                 $perClient[$sub->clientId] = [
                     'qos' => $effectiveQoS,
                     'subIds' => [],
                     'retainAsPublished' => $sub->retainAsPublished,
                 ];
+            } elseif ($effectiveQoS > $perClient[$sub->clientId]['qos']) {
+                // Raise the QoS without discarding identifiers already collected: every
+                // matching subscription's identifier must be sent (MQTT-3.3.4-3).
+                $perClient[$sub->clientId]['qos'] = $effectiveQoS;
             }
             if ($sub->subscriptionIdentifier > 0) {
                 $perClient[$sub->clientId]['subIds'][] = $sub->subscriptionIdentifier;
@@ -1120,6 +1154,13 @@ final class PacketHandler
 
         // Process shared subscriptions: pick one subscriber per group (round-robin)
         foreach ($sharedGroups as $groupName => $groupSubs) {
+            // noLocal applies here too: the publisher must not receive its own message
+            // through a shared subscription either (MQTT-3.8.3-3).
+            $groupSubs = array_values(array_filter(
+                $groupSubs,
+                static fn($sub): bool => !($sub->noLocal && $sub->clientId === $publisherClientId),
+            ));
+
             if ($groupSubs === []) {
                 continue;
             }

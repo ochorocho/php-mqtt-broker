@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Subscription;
 
+use PhpMqtt\Broker\Protocol\TopicFilter;
+
 final class SubscriptionManager
 {
     private readonly TopicMatcher $topicMatcher;
@@ -108,13 +110,6 @@ final class SubscriptionManager
      */
     private static function getMatchFilter(string $topicFilter): string
     {
-        if (str_starts_with($topicFilter, '$share/')) {
-            $parts = explode('/', $topicFilter, 3);
-            if (count($parts) >= 3) {
-                return $parts[2];
-            }
-        }
-
-        return $topicFilter;
+        return TopicFilter::stripSharedPrefix($topicFilter);
     }
 }
