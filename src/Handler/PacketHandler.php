@@ -52,17 +52,7 @@ final class PacketHandler
     private readonly RetainedMessageStore $retainedMessages;
     private readonly SessionManager $sessionManager;
 
-    /** @var array<string, array<int, PublishPacket>> clientId => [packetId => PublishPacket] for QoS 2 incoming */
-    private array $pendingIncomingQoS2 = [];
-
-    /** @var array<string, int> clientId => next packet ID */
-    private array $nextPacketId = [];
-
-    /** @var array<string, array<int, PublishPacket>> clientId => [packetId => PublishPacket] pending outgoing QoS 1/2 */
-    private array $pendingOutgoing = [];
-
-    /** @var array<string, array<int, true>> clientId => [packetId => true] QoS 2 outgoing PUBREC received */
-    private array $pendingQoS2Release = [];
+    private readonly InFlightMessageTracker $inFlight;
 
     /** @var array<string, \React\EventLoop\TimerInterface> clientId => will delay timer */
     private array $willDelayTimers = [];
@@ -85,6 +75,7 @@ final class PacketHandler
             maxBytes: $this->config->maxRetainedBytes,
         );
         $this->sessionManager = new SessionManager(maxSessions: $this->config->maxSessions);
+        $this->inFlight = new InFlightMessageTracker();
     }
 
     public function getRetainedMessages(): RetainedMessageStore
@@ -182,7 +173,7 @@ final class PacketHandler
         if (!$shouldSaveSession) {
             $this->subscriptionManager->removeClient($clientId);
             $this->sessionManager->destroy($clientId);
-            $this->cleanupClientState($clientId);
+            $this->inFlight->forget($clientId);
         } else {
             $subscriptions = array_values($this->subscriptionManager->getClientSubscriptions($clientId));
             $session = $this->sessionManager->getOrCreate($clientId);
@@ -207,13 +198,11 @@ final class PacketHandler
 
             // Save pending outgoing messages (QoS 1/2 not yet acknowledged)
             // so they can be redelivered on reconnect
-            if (isset($this->pendingOutgoing[$clientId])) {
-                foreach ($this->pendingOutgoing[$clientId] as $pendingPacket) {
-                    $this->queuePendingMessage($session, $pendingPacket);
-                }
+            foreach ($this->inFlight->unacknowledged($clientId) as $pendingPacket) {
+                $this->queuePendingMessage($session, $pendingPacket);
             }
 
-            $this->cleanupClientState($clientId);
+            $this->inFlight->forget($clientId);
         }
     }
 
@@ -402,7 +391,7 @@ final class PacketHandler
         if ($packet->cleanSession) {
             $this->sessionManager->destroy($clientId);
             $this->subscriptionManager->removeClient($clientId);
-            $this->cleanupClientState($clientId);
+            $this->inFlight->forget($clientId);
         } else {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
@@ -481,7 +470,7 @@ final class PacketHandler
                     }
 
                     $packetId = $msg->qos > 0
-                        ? ($msg->packetId ?? $this->allocatePacketId($clientId))
+                        ? ($msg->packetId ?? $this->inFlight->allocatePacketId($clientId))
                         : null;
                     $deliverMsg = new PublishPacket(
                         topicName: $msg->topicName,
@@ -493,11 +482,7 @@ final class PacketHandler
                         protocolVersion: $connection->getProtocolVersion(),
                         properties: $msg->properties,
                     );
-                    if ($deliverMsg->qos > 0 && $deliverMsg->packetId !== null) {
-                        $this->pendingOutgoing[$clientId][$deliverMsg->packetId] = $deliverMsg;
-                        $connection->incrementUnackedOutgoing();
-                    }
-                    $connection->send($deliverMsg);
+                    $this->inFlight->sendTracked($connection, $deliverMsg, $clientId);
                 }
                 $session->pendingMessages = [];
             }
@@ -557,7 +542,7 @@ final class PacketHandler
         }
 
         if ($packet->qos > 0) {
-            $incomingCount = count($this->pendingIncomingQoS2[$clientId] ?? []);
+            $incomingCount = $this->inFlight->countIncoming($clientId);
             if ($incomingCount >= self::SERVER_RECEIVE_MAXIMUM) {
                 $connection->setConnected(false);
                 if ($connection->getProtocolVersion() === ProtocolVersion::V50) {
@@ -608,7 +593,7 @@ final class PacketHandler
 
         // QoS 2: Send PUBREC to publisher, defer delivery until PUBREL
         if ($packet->qos === 2 && $packet->packetId !== null) {
-            $this->pendingIncomingQoS2[$clientId][$packet->packetId] = $packet;
+            $this->inFlight->holdIncoming($clientId, $packet);
             $connection->send(new PubrecPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $connection->getProtocolVersion(),
@@ -631,7 +616,7 @@ final class PacketHandler
             return;
         }
 
-        unset($this->pendingOutgoing[$clientId][$packet->packetId]);
+        $this->inFlight->acknowledgeOutgoing($clientId, $packet->packetId);
         $connection->decrementUnackedOutgoing();
         $this->drainPendingMessages($connection);
     }
@@ -646,8 +631,7 @@ final class PacketHandler
             return;
         }
 
-        unset($this->pendingOutgoing[$clientId][$packet->packetId]);
-        $this->pendingQoS2Release[$clientId][$packet->packetId] = true;
+        $this->inFlight->awaitPubcomp($clientId, $packet->packetId);
 
         $connection->send(new PubrelPacket(
             packetId: $packet->packetId,
@@ -665,8 +649,7 @@ final class PacketHandler
             return;
         }
 
-        $storedPacket = $this->pendingIncomingQoS2[$clientId][$packet->packetId] ?? null;
-        unset($this->pendingIncomingQoS2[$clientId][$packet->packetId]);
+        $storedPacket = $this->inFlight->takeIncoming($clientId, $packet->packetId);
 
         $connection->send(new PubcompPacket(
             packetId: $packet->packetId,
@@ -701,7 +684,7 @@ final class PacketHandler
             return;
         }
 
-        unset($this->pendingQoS2Release[$clientId][$packet->packetId]);
+        $this->inFlight->completeOutgoing($clientId, $packet->packetId);
         $connection->decrementUnackedOutgoing();
         $this->drainPendingMessages($connection);
     }
@@ -810,7 +793,7 @@ final class PacketHandler
             $retained = $this->retainedMessages->getMatching($retainedMatchTopic);
             foreach ($retained as $retainedPacket) {
                 $deliverQoS = min($retainedPacket->qos, $qos);
-                $packetId = $deliverQoS > 0 ? $this->allocatePacketId($clientId) : null;
+                $packetId = $deliverQoS > 0 ? $this->inFlight->allocatePacketId($clientId) : null;
 
                 $retainedProps = null;
                 if ($version === ProtocolVersion::V50) {
@@ -850,13 +833,7 @@ final class PacketHandler
                     continue;
                 }
 
-                $connection->send($deliverPacket);
-                if ($deliverQoS > 0 && $deliverPacket->packetId !== null) {
-                    $this->pendingOutgoing[$clientId][$deliverPacket->packetId] = $deliverPacket;
-                    // Without this the counter drifts from pendingOutgoing and flow
-                    // control degrades for the rest of the session.
-                    $connection->incrementUnackedOutgoing();
-                }
+                $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
             }
         }
 
@@ -1193,7 +1170,7 @@ final class PacketHandler
             $version = $session !== null ? $session->protocolVersion : ProtocolVersion::V311;
         }
 
-        $packetId = $qos > 0 ? $this->allocatePacketId($clientId) : null;
+        $packetId = $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null;
 
         $topicName = $originalPacket->topicName;
         $aliasInfo = null;
@@ -1253,11 +1230,7 @@ final class PacketHandler
                 return;
             }
 
-            $connection->send($deliverPacket);
-            if ($qos > 0 && $packetId !== null) {
-                $this->pendingOutgoing[$clientId][$packetId] = $deliverPacket;
-                $connection->incrementUnackedOutgoing();
-            }
+            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
         } else {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
@@ -1284,7 +1257,7 @@ final class PacketHandler
         while ($session->pendingMessages !== [] && ($connection->getUnackedOutgoing() < $connection->getReceiveMaximum())) {
             $msg = array_shift($session->pendingMessages);
             if ($msg->qos > 0) {
-                $packetId = $this->allocatePacketId($clientId);
+                $packetId = $this->inFlight->allocatePacketId($clientId);
                 $msg = new PublishPacket(
                     topicName: $msg->topicName,
                     payload: $msg->payload,
@@ -1295,10 +1268,8 @@ final class PacketHandler
                     protocolVersion: $msg->protocolVersion,
                     properties: $msg->properties,
                 );
-                $this->pendingOutgoing[$clientId][$packetId] = $msg;
-                $connection->incrementUnackedOutgoing();
             }
-            $connection->send($msg);
+            $this->inFlight->sendTracked($connection, $msg, $clientId);
         }
     }
 
@@ -1354,35 +1325,4 @@ final class PacketHandler
         }
     }
 
-    private function allocatePacketId(string $clientId): int
-    {
-        if (!isset($this->nextPacketId[$clientId])) {
-            $this->nextPacketId[$clientId] = 1;
-        }
-
-        $id = $this->nextPacketId[$clientId];
-        $this->nextPacketId[$clientId] = ($id >= 65535) ? 1 : $id + 1;
-
-        $maxAttempts = 65535;
-        while (
-            $maxAttempts > 0
-            && (isset($this->pendingOutgoing[$clientId][$id]) || isset($this->pendingQoS2Release[$clientId][$id]))
-        ) {
-            $id = $this->nextPacketId[$clientId];
-            $this->nextPacketId[$clientId] = ($id >= 65535) ? 1 : $id + 1;
-            $maxAttempts--;
-        }
-
-        return $id;
-    }
-
-    private function cleanupClientState(string $clientId): void
-    {
-        unset(
-            $this->pendingIncomingQoS2[$clientId],
-            $this->pendingOutgoing[$clientId],
-            $this->pendingQoS2Release[$clientId],
-            $this->nextPacketId[$clientId],
-        );
-    }
 }
