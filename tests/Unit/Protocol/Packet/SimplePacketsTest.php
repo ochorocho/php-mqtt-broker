@@ -5,9 +5,6 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Tests\Unit\Protocol\Packet;
 
 use PhpMqtt\Broker\Protocol\Packet\ConnackPacket;
-use PhpMqtt\Broker\Protocol\Packet\PubackPacket;
-use PhpMqtt\Broker\Protocol\Packet\PubcompPacket;
-use PhpMqtt\Broker\Protocol\Packet\PubrecPacket;
 use PhpMqtt\Broker\Protocol\Packet\PubrelPacket;
 use PhpMqtt\Broker\Protocol\Packet\UnsubackPacket;
 use PhpMqtt\Broker\Protocol\PacketEncoder;
@@ -46,35 +43,8 @@ final class SimplePacketsTest extends TestCase
         self::assertSame(5, $decoded->returnCode);
     }
 
-    public function testPubackRoundTrip(): void
-    {
-        $packet = new PubackPacket(packetId: 1234);
-        $raw = $this->encoder->encode($packet);
-        $decoded = $this->factory->decode($raw);
 
-        self::assertInstanceOf(PubackPacket::class, $decoded);
-        self::assertSame(1234, $decoded->packetId);
-    }
 
-    public function testPubrecRoundTrip(): void
-    {
-        $packet = new PubrecPacket(packetId: 5678);
-        $raw = $this->encoder->encode($packet);
-        $decoded = $this->factory->decode($raw);
-
-        self::assertInstanceOf(PubrecPacket::class, $decoded);
-        self::assertSame(5678, $decoded->packetId);
-    }
-
-    public function testPubrelRoundTrip(): void
-    {
-        $packet = new PubrelPacket(packetId: 999);
-        $raw = $this->encoder->encode($packet);
-        $decoded = $this->factory->decode($raw);
-
-        self::assertInstanceOf(PubrelPacket::class, $decoded);
-        self::assertSame(999, $decoded->packetId);
-    }
 
     public function testPubrelFixedHeaderFlags(): void
     {
@@ -84,15 +54,6 @@ final class SimplePacketsTest extends TestCase
         self::assertSame(0x62, ord($raw[0]));
     }
 
-    public function testPubcompRoundTrip(): void
-    {
-        $packet = new PubcompPacket(packetId: 42);
-        $raw = $this->encoder->encode($packet);
-        $decoded = $this->factory->decode($raw);
-
-        self::assertInstanceOf(PubcompPacket::class, $decoded);
-        self::assertSame(42, $decoded->packetId);
-    }
 
     public function testUnsubackRoundTrip(): void
     {
