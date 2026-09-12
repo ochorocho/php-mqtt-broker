@@ -251,11 +251,17 @@ It is marked experimental at the top of this README, and these gaps are real:
 
 - **No rate limiting, and no per-IP accounting.** `ConnectionManager` does not
   record remote addresses, so password guessing is unthrottled.
-- **A failed login logs nothing.** Authorization failures are logged only when an
-  authenticator *throws*; a wrong password produces a CONNACK and a close,
-  silently. **fail2ban cannot protect this broker** — there is no line to match,
-  and the only pre-auth lines carrying an address are `debug` level, emitted on
-  every connection rather than on failure.
+- **Nothing slows a guessing run down.** A rejected login *is* logged — at
+  `warning`, with the username, the remote address and the client ID — but the
+  broker itself neither delays nor blocks the next attempt. Acting on those lines
+  is left to you. A fail2ban filter can match them:
+
+  ```
+  failregex = ^\[.*\] warning: Authentication failed for .* from <HOST>:\d+
+  ```
+
+  Usernames and client IDs are attacker-controlled, so control characters in them
+  are escaped before they reach the log and cannot forge entries.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
 - **Most limits are unreachable from the CLI.** `maxConnections`,
@@ -268,10 +274,12 @@ It is marked experimental at the top of this README, and these gaps are real:
 - **All state is in memory.** A restart — including one triggered by certificate
   renewal — drops retained messages and queued offline messages.
 
-Because guessing is both unlimited and invisible, the effective control is to
-keep the port away from the open internet: allow only the source addresses your
-clients use, or put the broker behind a VPN. Where clients are known and few,
-that single firewall rule does more than any amount of tuning.
+Failed logins are visible, but visibility is not a brake: the broker will answer
+the next attempt just as quickly. So the effective control remains keeping the
+port away from the open internet — allow only the source addresses your clients
+use, or put the broker behind a VPN. Where clients are known and few, that single
+firewall rule does more than any amount of tuning, and a log-based blocker is
+worth adding behind it rather than instead of it.
 
 ### PSR-3 Logging
 

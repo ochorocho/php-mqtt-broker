@@ -277,7 +277,7 @@ final class PacketHandler
                 'Authentication failed for {username} from {address} (client {clientId})',
                 [
                     'username' => self::forLog($packet->username ?? '<none>'),
-                    'address' => $connection->getRemoteAddress(),
+                    'address' => self::addressForLog($connection->getRemoteAddress()),
                     'clientId' => self::forLog($clientId),
                 ],
             );
@@ -1001,6 +1001,20 @@ final class PacketHandler
         $escaped = addcslashes($value, "\0..\37\\\177");
 
         return mb_strlen($escaped) > 128 ? mb_substr($escaped, 0, 128) . '…' : $escaped;
+    }
+
+    /**
+     * The peer address without the transport scheme.
+     *
+     * The stream reports `tcp://host:port` (or `tls://…`), but a log line is read by
+     * fail2ban and friends as well as by people, and a scheme that varies with the
+     * listener only complicates the pattern they have to match.
+     */
+    private static function addressForLog(string $remoteAddress): string
+    {
+        $withoutScheme = preg_replace('#^[a-z0-9.+-]+://#i', '', $remoteAddress) ?? $remoteAddress;
+
+        return self::forLog($withoutScheme);
     }
 
     /**

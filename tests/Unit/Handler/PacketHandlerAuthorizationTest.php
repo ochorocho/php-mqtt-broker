@@ -55,6 +55,19 @@ final class PacketHandlerAuthorizationTest extends PacketHandlerTestCase
         self::assertStringContainsString('127.0.0.1:1883', $warnings[0]);
     }
 
+    public function testLoggedAddressCarriesNoTransportScheme(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(authenticateResult: false));
+
+        $this->connect('nobody', username: 'mallory');
+
+        // The stream reports tcp:// or tls:// depending on the listener. A log-based
+        // blocker matches on the address, so the scheme must not vary underneath it.
+        $logged = $this->logger->messagesAt('warning')[0];
+        self::assertStringNotContainsString('://', $logged);
+        self::assertStringContainsString('from 127.0.0.1:1883', $logged);
+    }
+
     public function testSuccessfulLoginLogsNoAuthenticationFailure(): void
     {
         $this->makeHandler(new RecordingAuthenticator());
