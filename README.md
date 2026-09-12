@@ -218,6 +218,61 @@ With `--tls-cert` the default port is 8883. Note that MQTT credentials are sent
 in the clear on a plaintext listener, so prefer TLS whenever clients
 authenticate with a username and password.
 
+### Production deployment
+
+`deploy/mqtt-broker.service` is an example systemd unit. Four things matter more
+than the unit itself.
+
+**Run it as a non-root user.** The broker never drops privileges, and `--auth`
+executes an arbitrary PHP file with the broker's rights — as root, that file
+becomes a root-RCE path. Port 8883 is above 1024, so no capability is needed.
+Keep the code and the auth file owned by `root` and merely *readable* by the
+broker user, so a compromised process cannot rewrite them.
+
+**Expose TLS only.** The broker is a single process with a single listener: you
+cannot serve plaintext locally and TLS publicly from one instance. Always pass
+`--tls-cert`, and never open 1883 to an untrusted network — the username and
+password travel inside the CONNECT packet in the clear.
+
+**Certificates are read once, at startup.** `validateTls()` runs when the broker
+starts and refuses to start on an unreadable cert or key, rather than binding a
+listener that fails every handshake. A renewed certificate therefore does
+nothing until the service restarts, and there is no SIGHUP handler — wire your
+renewal to `systemctl restart mqtt-broker`. Keep the private key group-readable
+by the broker user and never world-readable, and avoid `--tls-passphrase`: it is
+visible in the process list and in the unit file.
+
+**Restrict who can reach the port.** See the limitations below for why this
+matters more here than for a mature broker.
+
+#### What this broker does not do
+
+It is marked experimental at the top of this README, and these gaps are real:
+
+- **No rate limiting, and no per-IP accounting.** `ConnectionManager` does not
+  record remote addresses, so password guessing is unthrottled.
+- **A failed login logs nothing.** Authorization failures are logged only when an
+  authenticator *throws*; a wrong password produces a CONNACK and a close,
+  silently. **fail2ban cannot protect this broker** — there is no line to match,
+  and the only pre-auth lines carrying an address are `debug` level, emitted on
+  every connection rather than on failure.
+- **`maxConnections` is global, not per-client**, and connections are admitted
+  before authentication.
+- **Most limits are unreachable from the CLI.** `maxConnections`,
+  `connectTimeout` and `maxPacketSize` require constructing `Configuration` in
+  your own entrypoint. Until then, bound the process with systemd
+  (`LimitNOFILE`, `MemoryMax`).
+- **`PasswordFileAuthenticator` grants every account full topic access**, so one
+  leaked credential can subscribe to `#`. Use `--auth` with per-topic rules when
+  accounts should not be equals.
+- **All state is in memory.** A restart — including one triggered by certificate
+  renewal — drops retained messages and queued offline messages.
+
+Because guessing is both unlimited and invisible, the effective control is to
+keep the port away from the open internet: allow only the source addresses your
+clients use, or put the broker behind a VPN. Where clients are known and few,
+that single firewall rule does more than any amount of tuning.
+
 ### PSR-3 Logging
 
 Pass any PSR-3 logger (Monolog, symfony/console-logger, etc.):

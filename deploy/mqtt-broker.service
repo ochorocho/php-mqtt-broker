@@ -1,0 +1,80 @@
+# Example systemd unit for running the broker on a TLS listener.
+#
+# Copy to /etc/systemd/system/mqtt-broker.service, replace the paths, then:
+#   systemctl daemon-reload && systemctl enable --now mqtt-broker
+#
+# See the "Production deployment" section of README.md for the user, file
+# permissions and firewall work this unit assumes has already been done.
+
+[Unit]
+Description=PHP MQTT Broker (TLS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mqtt
+Group=mqtt
+
+# --tls-cert is what makes the single listener a TLS one. The broker is one
+# process with one listener, so there is no plaintext port to firewall off as
+# long as this flag is present.
+ExecStart=/usr/bin/php /opt/mqtt-broker/bin/mqtt-broker \
+  --host=0.0.0.0 \
+  --port=8883 \
+  --tls-cert=/etc/mqtt/tls/server.crt \
+  --tls-key=/etc/mqtt/tls/server.key \
+  --password-file=/etc/mqtt/passwd
+
+Restart=on-failure
+RestartSec=5s
+# Stop rather than flap silently if the broker cannot stay up.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- Privilege containment -------------------------------------------------
+# The broker never drops privileges itself, and --auth executes an arbitrary PHP
+# file with the broker's rights: run as root, that file is a root-RCE path.
+# Port 8883 is above 1024, so no capability is required at all.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Filesystem ------------------------------------------------------------
+# The broker writes nothing: all state is in memory and the password file is
+# read once at startup. So the whole filesystem can be read-only, which is what
+# stops a compromised process from editing its own auth.php for persistence.
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/mqtt /opt/mqtt-broker
+PrivateTmp=true
+PrivateDevices=true
+UMask=0077
+
+# --- Kernel and namespace surface -----------------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+# ReactPHP needs TCP only; this blocks AF_UNIX/AF_NETLINK pivots.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Safe for PHP CLI without JIT. REMOVE THIS LINE if you enable OPcache JIT,
+# or PHP will refuse to start.
+MemoryDenyWriteExecute=true
+
+# --- Resource bounds -------------------------------------------------------
+# These substitute for limits the broker has but does not expose: maxConnections
+# defaults to 10000 at up to 1 MiB of buffer each, and is unreachable from the
+# CLI. Capping here turns exhaustion into a contained restart rather than an
+# OOM-killed VPS. Size MemoryMax to your host.
+LimitNOFILE=4096
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
