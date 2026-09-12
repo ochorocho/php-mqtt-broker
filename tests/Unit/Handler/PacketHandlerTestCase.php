@@ -31,6 +31,7 @@ abstract class PacketHandlerTestCase extends TestCase
     protected SubscriptionManager $subscriptions;
     protected PacketHandler $handler;
     protected RecordingAuthenticator $authenticator;
+    protected RecordingLogger $logger;
 
     protected function setUp(): void
     {
@@ -40,12 +41,14 @@ abstract class PacketHandlerTestCase extends TestCase
     protected function makeHandler(
         ?AuthenticatorInterface $authenticator = null,
         ?Configuration $config = null,
+        ?RecordingLogger $logger = null,
     ): void {
         $this->connections = new ConnectionManager();
         $this->subscriptions = new SubscriptionManager();
         $this->authenticator = $authenticator instanceof RecordingAuthenticator
             ? $authenticator
             : new RecordingAuthenticator();
+        $this->logger = $logger ?? new RecordingLogger();
 
         $this->handler = new PacketHandler(
             connectionManager: $this->connections,
@@ -53,6 +56,7 @@ abstract class PacketHandlerTestCase extends TestCase
             authenticator: $authenticator ?? $this->authenticator,
             loop: Loop::get(),
             packetEncoder: new PacketEncoder(),
+            logger: $this->logger,
             config: $config ?? new Configuration(),
         );
     }

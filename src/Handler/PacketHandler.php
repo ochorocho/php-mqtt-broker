@@ -271,6 +271,17 @@ final class PacketHandler
             'authenticate',
             $clientId,
         )) {
+            // The only record a rejected login leaves. Without it a guessing run is
+            // invisible, and there is nothing for a log-based blocker to match on.
+            $this->logger->warning(
+                'Authentication failed for {username} from {address} (client {clientId})',
+                [
+                    'username' => self::forLog($packet->username ?? '<none>'),
+                    'address' => $connection->getRemoteAddress(),
+                    'clientId' => self::forLog($clientId),
+                ],
+            );
+
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
                 returnCode: $version === ProtocolVersion::V50
@@ -976,6 +987,20 @@ final class PacketHandler
         }
 
         $session->pendingMessages[] = $packet;
+    }
+
+    /**
+     * Make an attacker-controlled string safe to interpolate into a log line.
+     *
+     * Usernames and client IDs come off the wire, and the UTF-8 validation they pass
+     * through rejects NUL and surrogates but not newlines — so an unescaped one could
+     * forge whole log entries and poison anything parsing them.
+     */
+    private static function forLog(string $value): string
+    {
+        $escaped = addcslashes($value, "\0..\37\\\177");
+
+        return mb_strlen($escaped) > 128 ? mb_substr($escaped, 0, 128) . '…' : $escaped;
     }
 
     /**

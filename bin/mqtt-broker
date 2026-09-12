@@ -119,7 +119,9 @@ $logger = new class extends \Psr\Log\AbstractLogger {
             array_map(fn($v) => $v instanceof \Throwable ? $v->getMessage() . "\n" . $v->getTraceAsString() : (string) $v, array_values($context)),
             (string) $message,
         );
-        fwrite(STDERR, sprintf("[%s] %s: %s\n", date('H:i:s'), $level, $msg));
+        // Full date and offset, so lines stay orderable across days and are usable as
+        // input to a log-based blocker rather than only readable by a human.
+        fwrite(STDERR, sprintf("[%s] %s: %s\n", date('Y-m-d H:i:sP'), $level, $msg));
     }
 };
 

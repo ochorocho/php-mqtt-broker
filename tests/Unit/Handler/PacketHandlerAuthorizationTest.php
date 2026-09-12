@@ -40,6 +40,52 @@ final class PacketHandlerAuthorizationTest extends PacketHandlerTestCase
         self::assertSame(0x86, $this->lastSent($connection, ConnackPacket::class)->returnCode);
     }
 
+    public function testRejectedCredentialsAreLoggedWithTheRemoteAddress(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(authenticateResult: false));
+
+        $this->connect('nobody', username: 'mallory');
+
+        // Without this line a guessing run leaves no trace at all, and a log-based
+        // blocker has nothing to match on.
+        $warnings = $this->logger->messagesAt('warning');
+        self::assertCount(1, $warnings);
+        self::assertStringContainsString('Authentication failed', $warnings[0]);
+        self::assertStringContainsString('mallory', $warnings[0]);
+        self::assertStringContainsString('127.0.0.1:1883', $warnings[0]);
+    }
+
+    public function testSuccessfulLoginLogsNoAuthenticationFailure(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator());
+
+        $this->connect('welcome', username: 'alice');
+
+        self::assertSame([], $this->logger->messagesAt('warning'));
+    }
+
+    public function testAnonymousRejectionNamesNoUsernameRatherThanBlank(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(authenticateResult: false));
+
+        $this->connect('anon');
+
+        self::assertStringContainsString('<none>', $this->logger->messagesAt('warning')[0]);
+    }
+
+    public function testUsernameCannotForgeALogLine(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(authenticateResult: false));
+
+        // A username is attacker-chosen and survives UTF-8 validation with newlines
+        // intact, so an unescaped one could fabricate whole entries.
+        $this->connect('nobody', username: "admin\n[00:00:00] warning: Authentication failed for root");
+
+        $logged = $this->logger->messagesAt('warning')[0];
+        self::assertStringNotContainsString("\n", $logged);
+        self::assertStringContainsString('\\n', $logged);
+    }
+
     public function testDeniedPublishNeverReachesSubscribersOrRetainedStore(): void
     {
         $this->makeHandler(new RecordingAuthenticator(deniedPublishTopics: ['secret/data']));
