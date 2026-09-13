@@ -328,7 +328,9 @@ messages, which the broker sends on a client's behalf rather than receiving.
 
 ## Testing with MQTT Clients
 
-Once the broker is running, connect with any MQTT client:
+Once the broker is running, connect with any MQTT client. These commands assume the
+default listener — `bin/mqtt-broker` with no flags, plaintext on 1883, accepting
+anyone:
 
 ```bash
 # Subscribe (using mosquitto_sub)
@@ -340,6 +342,11 @@ mosquitto_pub -h localhost -p 1883 -t 'test/topic' -m 'Hello MQTT'
 # MQTT 5.0 (using mosquitto_pub with -V)
 mosquitto_pub -h localhost -p 1883 -t 'test/topic' -m 'Hello' -V mqttv5
 ```
+
+Once you add `--password-file` or `--tls-cert` these no longer apply: the port
+becomes 8883, credentials are required, and a client ID that does not belong to the
+account is refused. See [Production deployment](#production-deployment) for the
+authenticated form, and use `-p 11883` under DDEV.
 
 ## Features
 
@@ -362,16 +369,16 @@ mosquitto_pub -h localhost -p 1883 -t 'test/topic' -m 'Hello' -V mqttv5
 
 ## Development (DDEV)
 
-The project includes a [DDEV](https://ddev.com/) configuration for local development. Port 1883 is exposed directly to the host, so host-side `mosquitto_pub`/`mosquitto_sub` reach the containerized broker. The `web_extra_daemons` entry that would start the broker automatically is commented out, so start it yourself.
+The project includes a [DDEV](https://ddev.com/) configuration for local development. The container's port 1883 is published on the host as **11883**, so host-side `mosquitto_pub`/`mosquitto_sub` reach the containerized broker without claiming the well-known port — another project on the same machine may be serving real clients on 1883. The `web_extra_daemons` entry that would start the broker automatically is commented out, so start it yourself.
 
 ```bash
 # Start the environment, then the broker
 ddev start
 ddev exec "cd /var/www/html && nohup php bin/mqtt-broker > /tmp/broker.log 2>&1 &"
 
-# Connect from the host
-mosquitto_sub -h localhost -p 1883 -t '#'
-mosquitto_pub -h localhost -p 1883 -t 'test/topic' -m 'Hello'
+# Connect from the host (11883 on the host, 1883 inside the container)
+mosquitto_sub -h localhost -p 11883 -t '#'
+mosquitto_pub -h localhost -p 11883 -t 'test/topic' -m 'Hello'
 
 # Run unit tests
 ddev exec vendor/bin/phpunit
