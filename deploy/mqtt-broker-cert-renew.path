@@ -1,0 +1,43 @@
+# Restart the broker when its TLS certificate is replaced.
+#
+# The broker reads the certificate and key once, at startup: validateTls() runs
+# before the listener binds and there is no SIGHUP handler. A renewed certificate
+# therefore does nothing at all until the service restarts.
+#
+# PREFER A RENEWAL HOOK IF YOUR TOOL HAS ONE. Certbot's --deploy-hook runs after
+# both files are in place:
+#
+#   certbot renew --deploy-hook 'systemctl restart mqtt-broker'
+#
+# That is simpler and cannot race. These path units exist for renewal systems that
+# only drop files into place (cert-manager, a config-management push, an rsync).
+#
+# THE RACE, IF YOU USE THIS. A .path unit fires on the first write it sees. If your
+# renewal writes the key and the certificate as two separate operations, the watcher
+# can fire between them and restart the broker onto a mismatched pair. validateTls()
+# passes -- both files are readable -- so the broker starts happily and then fails
+# every TLS handshake. Because that is not a startup error, Restart=on-failure never
+# recovers it, and the listener stays broken until the next renewal.
+#
+# So: watch ONLY the certificate, and have your renewal write the key first and the
+# certificate last, each with mv onto its final path. mv within a filesystem is
+# atomic, so no partial file is ever observed, and by the time this unit fires the
+# key is already consistent with the certificate that triggered it.
+#
+# Note that a restart drops all retained messages and queued offline messages (the
+# broker keeps everything in memory), and reconnects every client at once.
+#
+# Install:
+#   cp deploy/mqtt-broker-cert-renew.{path,service} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now mqtt-broker-cert-renew.path
+
+[Unit]
+Description=Watch the MQTT broker's TLS certificate for renewal
+
+[Path]
+PathChanged=/etc/mqtt/tls/server.crt
+Unit=mqtt-broker-cert-renew.service
+
+[Install]
+WantedBy=multi-user.target

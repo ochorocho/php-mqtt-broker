@@ -1,0 +1,12 @@
+# Triggered by mqtt-broker-cert-renew.path when the certificate changes.
+#
+# A restart rather than a reload: the broker traps SIGINT and SIGTERM to shut down
+# cleanly, but has no SIGHUP handler, and the certificate is only read while the
+# listener is being bound.
+
+[Unit]
+Description=Restart the MQTT broker after a certificate renewal
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart mqtt-broker.service

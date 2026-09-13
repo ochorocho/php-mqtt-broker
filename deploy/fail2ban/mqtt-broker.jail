@@ -1,0 +1,44 @@
+# fail2ban jail for the PHP MQTT broker.
+#
+# Install as /etc/fail2ban/jail.d/mqtt-broker.local
+#
+# READ THIS FIRST: PICK THE RIGHT BACKEND.
+#
+# deploy/mqtt-broker.service sets no StandardOutput or StandardError, so the broker's
+# stderr goes to the journal. journald stores its own timestamp and metadata, and a
+# filter anchored with ^\[ will not match what fail2ban reads from a plain logpath.
+# Getting this wrong gives you a jail that starts cleanly, reports zero matches
+# forever, and looks like it is protecting you.
+#
+# Use the systemd backend (default below) unless you have redirected the broker's
+# output to a file, in which case comment it out and use the logpath form instead.
+#
+# Verify before trusting it:
+#   fail2ban-regex systemd-journal /etc/fail2ban/filter.d/mqtt-broker.conf --journalmatch '_SYSTEMD_UNIT=mqtt-broker.service'
+#   fail2ban-client status mqtt-broker
+#
+# A ban is per source address. Device fleets behind one NAT share an address, so one
+# compromised or misconfigured device can ban the whole site. Keep maxretry generous
+# enough to survive a legitimate password rotation.
+#
+# This jail is a brake, not a lock: the broker has no rate limiting of its own, so
+# restricting who can reach port 8883 at the firewall remains the primary control.
+# A jail belongs behind that, not instead of it.
+
+[mqtt-broker]
+enabled  = true
+filter   = mqtt-broker
+port     = 8883
+protocol = tcp
+
+# --- journald (matches deploy/mqtt-broker.service as shipped) ---
+backend      = systemd
+journalmatch = _SYSTEMD_UNIT=mqtt-broker.service
+
+# --- file, if you redirect the broker's output instead ---
+# backend = auto
+# logpath = /var/log/mqtt-broker.log
+
+maxretry = 8
+findtime = 10m
+bantime  = 1h
