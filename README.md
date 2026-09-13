@@ -220,8 +220,92 @@ authenticate with a username and password.
 
 ### Production deployment
 
-`deploy/mqtt-broker.service` is an example systemd unit. Four things matter more
-than the unit itself.
+`deploy/` holds example artifacts to copy and edit: `mqtt-broker.service`,
+a `mqtt-broker-cert-renew.path`/`.service` pair for picking up a renewed
+certificate, and `fail2ban/` with a filter and a jail.
+
+#### From clone to running
+
+1. Create a system user for the broker and the directories it reads:
+
+   ```bash
+   adduser --system --group --no-create-home --shell /usr/sbin/nologin mqtt
+   install -d -o root -g root -m 0755 /opt/mqtt-broker
+   install -d -o root -g mqtt -m 0750 /etc/mqtt
+   ```
+
+2. Deploy the code as root-owned and merely readable by `mqtt`, so a compromised
+   broker cannot rewrite its own code:
+
+   ```bash
+   git clone https://github.com/ochorocho/php-mqtt-broker /opt/mqtt-broker
+   cd /opt/mqtt-broker && composer install --no-dev --optimize-autoloader
+   chown -R root:root /opt/mqtt-broker
+   ```
+
+3. Create an account per device. The client ID must belong to the account, so name
+   them together:
+
+   ```bash
+   php /opt/mqtt-broker/bin/mqtt-passwd /etc/mqtt/passwd sensor01
+   chown root:mqtt /etc/mqtt/passwd && chmod 0640 /etc/mqtt/passwd
+   ```
+
+4. Put the certificate and key in place. The key is group-readable by `mqtt` and
+   never world-readable, and the certificate should be the full chain:
+
+   ```bash
+   chown root:mqtt /etc/mqtt/tls/server.key && chmod 0640 /etc/mqtt/tls/server.key
+   chown root:mqtt /etc/mqtt/tls/server.crt && chmod 0644 /etc/mqtt/tls/server.crt
+   ```
+
+5. Install the unit, edit its paths, and start it:
+
+   ```bash
+   cp deploy/mqtt-broker.service /etc/systemd/system/
+   systemctl daemon-reload
+   systemctl enable --now mqtt-broker
+   ```
+
+#### Verifying it works
+
+```bash
+systemctl status mqtt-broker
+journalctl -u mqtt-broker -f
+```
+
+Then connect for real — note `-i`, which matters more than it looks:
+
+```bash
+mosquitto_sub -h mqtt.example.com -p 8883 --capath /etc/ssl/certs \
+  -i sensor01 -u sensor01 -P 'secret' -t 'sensor01/#' -v
+```
+
+Leave `-i` out and the client library invents a random ID, which the account does
+not own, and the connection is refused with `CONNACK (5) not authorised` — the same
+code a wrong password returns. The log tells them apart:
+
+```
+warning: Client ID mosq-AbC123 not allowed for sensor01 from 203.0.113.10:51234
+warning: Authentication failed for sensor01 from 203.0.113.10:51234 (client sensor01)
+```
+
+The first names the fix: give the client an ID its account owns (`sensor01`, or
+`sensor01-`-prefixed). If your devices set client IDs you cannot control, start the
+broker with `--allow-any-client-id` — at the cost of letting any valid account
+evict any other client and inherit its session.
+
+#### Certificate renewal
+
+The certificate is read once, at startup. Wire your renewal to
+`systemctl restart mqtt-broker` — a certbot `--deploy-hook` is simplest. If your
+renewal only drops files, use the `mqtt-broker-cert-renew` units, and write the key
+first and the certificate last so the watcher cannot fire on a mismatched pair; the
+`.path` file explains why.
+
+#### Why the unit looks the way it does
+
+Four things matter more than the unit itself.
 
 **Run it as a non-root user.** The broker never drops privileges, and `--auth`
 executes an arbitrary PHP file with the broker's rights — as root, that file
@@ -262,6 +346,12 @@ It is marked experimental at the top of this README, and these gaps are real:
 
   Usernames and client IDs are attacker-controlled, so control characters in them
   are escaped before they reach the log and cannot forge entries.
+
+  A refused *client ID* is logged too, but on a separate line that the filter
+  deliberately does not match — and should not. It means the password was correct
+  and only the ID was wrong, which is what a misconfigured device emits on every
+  reconnect; banning on it would lock out a whole NAT'd fleet, and whoever is
+  debugging it, within seconds of a rollout.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
 - **Most limits are unreachable from the CLI.** `maxConnections`,
