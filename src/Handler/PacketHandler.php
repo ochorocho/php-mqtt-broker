@@ -301,6 +301,19 @@ final class PacketHandler
             'canUseClientId',
             $clientId,
         )) {
+            // A correct password with a client ID the account does not own. The CONNACK
+            // is the same 0x05 as a wrong password, so without a line of its own the two
+            // are indistinguishable — which is exactly how a device with the wrong
+            // client_id gets mistaken for someone guessing credentials.
+            $this->logger->warning(
+                'Client ID {clientId} not allowed for {username} from {address}',
+                [
+                    'clientId' => self::forLog($clientId),
+                    'username' => self::forLog($packet->username ?? '<none>'),
+                    'address' => self::addressForLog($connection->getRemoteAddress()),
+                ],
+            );
+
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
                 returnCode: $version === ProtocolVersion::V50
@@ -322,6 +335,18 @@ final class PacketHandler
                 $packet->willTopic,
             )
         ) {
+            // No address here, deliberately. Reaching this needs a passed authentication
+            // plus a custom ACL authenticator, so it reports a misconfigured client rather
+            // than an intruder — and an address would invite a fail2ban rule that bans
+            // authenticated, legitimate devices.
+            $this->logger->warning(
+                'Will topic {topic} denied for {clientId} at connect, connection refused',
+                [
+                    'topic' => self::forLog($packet->willTopic ?? ''),
+                    'clientId' => self::forLog($clientId),
+                ],
+            );
+
             $connection->send(new ConnackPacket(
                 sessionPresent: false,
                 returnCode: $version === ProtocolVersion::V50

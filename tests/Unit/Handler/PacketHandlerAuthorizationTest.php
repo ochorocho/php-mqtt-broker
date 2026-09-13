@@ -188,6 +188,49 @@ final class PacketHandlerAuthorizationTest extends PacketHandlerTestCase
         self::assertTrue($this->stream($connection)->closed);
     }
 
+    public function testRefusedClientIdIsLoggedWithTheUsernameAndAddress(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(deniedClientIds: ['mosq-AbC123']));
+
+        $this->connect('mosq-AbC123', username: 'alice');
+
+        // The password was right; only the client ID was wrong. This line names the
+        // field the operator has to change.
+        $warnings = $this->logger->messagesAt('warning');
+        self::assertCount(1, $warnings);
+        self::assertStringContainsString('mosq-AbC123', $warnings[0]);
+        self::assertStringContainsString('alice', $warnings[0]);
+        self::assertStringContainsString('127.0.0.1:1883', $warnings[0]);
+        self::assertStringNotContainsString('://', $warnings[0]);
+    }
+
+    public function testRefusedClientIdIsDistinguishableFromABadPassword(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(deniedClientIds: ['mosq-AbC123']));
+
+        $this->connect('mosq-AbC123', username: 'alice');
+
+        // The fail2ban filter matches "Authentication failed" and must never match this:
+        // a misconfigured device repeats it on every reconnect, and banning on it would
+        // lock out the operator's own fleet.
+        self::assertStringNotContainsString(
+            'Authentication failed',
+            $this->logger->messagesAt('warning')[0],
+        );
+    }
+
+    public function testRefusedClientIdCannotForgeALogLine(): void
+    {
+        $forged = "victim\n[00:00:00] warning: Authentication failed for root";
+        $this->makeHandler(new RecordingAuthenticator(deniedClientIds: [$forged]));
+
+        $this->connect($forged, username: 'alice');
+
+        $logged = $this->logger->messagesAt('warning')[0];
+        self::assertStringNotContainsString("\n", $logged);
+        self::assertStringContainsString('\\n', $logged);
+    }
+
     public function testTakeoverCannotStealAnotherClientsSession(): void
     {
         $this->makeHandler(new RecordingAuthenticator(deniedClientIds: ['sensor-01']));
@@ -224,6 +267,51 @@ final class PacketHandlerAuthorizationTest extends PacketHandlerTestCase
         // silently much later, when the client is no longer around to be told.
         self::assertFalse($connection->isConnected());
         self::assertTrue($this->stream($connection)->closed);
+    }
+
+    public function testRefusedWillTopicIsLoggedAtConnectTime(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(deniedPublishTopics: ['admin/shutdown']));
+
+        $this->handler->handle($this->connection(), new ConnectPacket(
+            protocolName: 'MQTT',
+            protocolLevel: ProtocolVersion::V311->value,
+            cleanSession: true,
+            keepAlive: 60,
+            clientId: 'willer',
+            hasWill: true,
+            willTopic: 'admin/shutdown',
+            willPayload: 'boom',
+        ));
+
+        // The runtime will-publish warning never fires for a client refused here, so
+        // without this line the refusal leaves no trace at all.
+        $warnings = $this->logger->messagesAt('warning');
+        self::assertCount(1, $warnings);
+        self::assertStringContainsString('admin/shutdown', $warnings[0]);
+        self::assertStringContainsString('willer', $warnings[0]);
+    }
+
+    public function testRefusedWillTopicIsNotLoggedWithARemoteAddress(): void
+    {
+        $this->makeHandler(new RecordingAuthenticator(deniedPublishTopics: ['admin/shutdown']));
+
+        $this->handler->handle($this->connection(), new ConnectPacket(
+            protocolName: 'MQTT',
+            protocolLevel: ProtocolVersion::V311->value,
+            cleanSession: true,
+            keepAlive: 60,
+            clientId: 'willer',
+            hasWill: true,
+            willTopic: 'admin/shutdown',
+            willPayload: 'boom',
+        ));
+
+        // Deliberately not matchable by a log-based blocker: this reports a
+        // misconfigured client, not an intruder.
+        $logged = $this->logger->messagesAt('warning')[0];
+        self::assertStringNotContainsString('127.0.0.1', $logged);
+        self::assertStringNotContainsString('from ', $logged);
     }
 
     public function testRestoredSubscriptionsAreReauthorizedOnReconnect(): void
