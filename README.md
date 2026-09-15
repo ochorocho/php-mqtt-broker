@@ -132,51 +132,12 @@ connect flags byte). Most client libraries expose this as a
 `setCredentials($username, $password)` call before connecting. Keep the
 credentials in extension configuration, not in source.
 
-The same interface is available when embedding the broker as a library:
-
-```php
-<?php
-
-use PhpMqtt\Broker\Auth\AuthenticatorInterface;
-use PhpMqtt\Broker\Broker;
-use PhpMqtt\Broker\Configuration;
-
-class MyAuthenticator implements AuthenticatorInterface
-{
-    public function authenticate(string $clientId, ?string $username, ?string $password): bool
-    {
-        return $username === 'admin' && $password === 'secret';
-    }
-
-    public function canSubscribe(string $clientId, string $topicFilter): bool
-    {
-        return true;
-    }
-
-    public function canPublish(string $clientId, string $topicName): bool
-    {
-        return true;
-    }
-
-    /**
-     * Bind the client ID to the authenticated user.
-     *
-     * Connecting with another client's ID evicts that client and, for persistent
-     * sessions, inherits its subscriptions and queued messages — so returning
-     * `true` unconditionally here lets any valid account hijack any other.
-     */
-    public function canUseClientId(string $clientId, ?string $username): bool
-    {
-        return $clientId === $username . '-device';
-    }
-}
-
-$broker = new Broker(
-    config: new Configuration(),
-    authenticator: new MyAuthenticator(),
-);
-$broker->start();
-```
+The same interface is available when embedding the broker as a library, by passing
+`authenticator:` to `Broker`. Before you write one, read
+[the authenticator contract](docs/embedding.md#the-authenticator-contract): only
+`authenticate()` and `canUseClientId()` receive the username, so per-user topic rules
+need the client ID recorded against its account during `authenticate()`. That page has
+a worked example.
 
 ### TLS
 
