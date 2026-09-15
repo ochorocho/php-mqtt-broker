@@ -53,6 +53,11 @@ $broker = new Broker(config: $config);
 $broker->start();
 ```
 
+`start()` runs the event loop and **does not return**, so this shape suits a process
+dedicated to the broker. To run it inside an application that has its own event loop,
+to shut it down cleanly, or to implement an authenticator, see
+[docs/embedding.md](docs/embedding.md).
+
 ### Authentication
 
 Without an authentication option the broker accepts every client, which is fine
