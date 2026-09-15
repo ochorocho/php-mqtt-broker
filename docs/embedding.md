@@ -376,6 +376,67 @@ packets.
 The same shape gives you an alternative transport. Implement both interfaces over
 WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
-## Still to come
+## Configuration reference
 
-- **Configuration reference** — all 21 options, most of which the CLI cannot set.
+`Configuration` is a value object: 21 constructor parameters, all with defaults, all
+readonly. **Only seven are reachable from the CLI** — `host`, `port` and the five
+`--tls-*` options. The other fourteen can only be set by constructing it yourself,
+which is the main reason to embed the broker rather than run the binary.
+
+```php
+$config = new Configuration(
+    host: '127.0.0.1',
+    port: 8883,
+    maxConnections: 500,
+    maxPacketSize: 4 * 1024 * 1024,
+    maxRetainedBytes: 16 * 1024 * 1024,
+);
+```
+
+### Listener
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `host` | `string` | `'0.0.0.0'` | Bind address. `0.0.0.0` is every interface. |
+| `port` | `int` | `1883` | Bind port. Use 8883 by convention when TLS is on. |
+| `maxConnections` | `int` | `10000` | Concurrent connections accepted; beyond this new sockets are closed immediately. Global, not per-IP. |
+| `connectTimeout` | `float` | `10.0` | Seconds a connection may stay open before sending CONNECT. Bounds what an unauthenticated peer can hold. |
+| `maxPacketSize` | `int` | `1048576` | Largest accepted inbound packet, in bytes. Also caps a connection's receive buffer, so a client cannot stream unbounded data without completing a packet. |
+| `maxClientIdLength` | `int` | `256` | Client identifier length in bytes. |
+
+### Sessions and keep-alive
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `minKeepAlive` | `int` | `300` | Lower bound applied when a client requests keep-alive 0, which would otherwise never be reaped. |
+| `maxSessions` | `int` | `10000` | Persistent sessions retained; the oldest idle session is evicted beyond this. |
+| `maxSessionExpiry` | `int` | `86400` | Ceiling for a session's expiry interval, in seconds. MQTT 3.1.1 sessions have no expiry of their own. |
+| `maxPendingMessagesPerSession` | `int` | `1000` | Offline queue depth per session. When full the oldest message is dropped and logged at `warning`. |
+
+### Subscriptions and retained messages
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `maxSubscriptionsPerClient` | `int` | `1000` | Active subscriptions per client. |
+| `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic or filter. |
+| `maxRetainedMessages` | `int` | `10000` | Distinct retained topics. |
+| `maxRetainedBytes` | `int` | `67108864` | Total retained payload bytes — the real memory bound, since everything is in-process. |
+
+### TLS
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `tlsCertPath` | `?string` | `null` | Server certificate. Setting it is what enables TLS. |
+| `tlsKeyPath` | `?string` | `null` | Private key. |
+| `tlsKeyPassphrase` | `?string` | `null` | Passphrase for an encrypted private key. |
+| `tlsRequireClientCert` | `bool` | `false` | Require and verify a client certificate (mutual TLS). Needs `tlsClientCaPath`. |
+| `tlsClientCaPath` | `?string` | `null` | CA bundle used to verify client certificates. |
+| `tlsCiphers` | `?string` | `null` | OpenSSL cipher list. Null uses the PHP default. |
+| `tlsMinVersion` | `int` | `STREAM_CRYPTO_METHOD_TLSv1_2_SERVER` | Minimum protocol, as an OpenSSL crypto-method constant. Defaults to TLS 1.2 or better; PHP's own default would still negotiate TLS 1.0 on some builds. |
+
+### Not configurable
+
+Three server-side values are compile-time constants, despite appearing in the feature
+list as though they were tunable: the server's Receive Maximum is 20, its Topic Alias
+Maximum is 10, and the Server Keep Alive it advertises to MQTT 5.0 clients is 60
+seconds.

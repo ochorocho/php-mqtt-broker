@@ -8,12 +8,18 @@ A pure-PHP MQTT broker supporting MQTT 3.1.1 and 5.0, built on [ReactPHP](https:
 
 - PHP 8.3+
 - Composer
+- `ext-openssl`, for TLS listeners only — a plaintext broker does not need it
+- Pulls in `react/socket`, `react/event-loop`, `psr/log` and `psr/event-dispatcher`
 
 ## Installation
 
 ```bash
 composer require ochorocho/php-mqtt-broker
 ```
+
+Installed as a dependency, the two binaries are at `vendor/bin/mqtt-broker` and
+`vendor/bin/mqtt-passwd`. The examples below use the `bin/` paths of a clone; if you
+installed with Composer, read them as `vendor/bin/`.
 
 ## Quick Start
 
@@ -320,10 +326,12 @@ It is marked experimental at the top of this README, and these gaps are real:
   debugging it, within seconds of a rollout.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
-- **Most limits are unreachable from the CLI.** `maxConnections`,
-  `connectTimeout` and `maxPacketSize` require constructing `Configuration` in
-  your own entrypoint. Until then, bound the process with systemd
-  (`LimitNOFILE`, `MemoryMax`).
+- **Most limits are unreachable from the CLI.** Only 7 of `Configuration`'s 21
+  options have flags — `host`, `port` and the five `--tls-*` ones. The other 14,
+  including every `max*` limit and `connectTimeout`, require constructing
+  `Configuration` in your own entrypoint; see the
+  [configuration reference](docs/embedding.md#configuration-reference). Until then,
+  bound the process with systemd (`LimitNOFILE`, `MemoryMax`).
 - **`PasswordFileAuthenticator` grants every account full topic access**, so one
   leaked credential can subscribe to `#`. Use `--auth` with per-topic rules when
   accounts should not be equals.
@@ -405,7 +413,10 @@ authenticated form, and use `-p 11883` under DDEV.
 - Password-file authentication with hashed credentials (`bin/mqtt-passwd`)
 - Custom authentication and authorization via `AuthenticatorInterface`
 - TLS support
-- PSR-3 logging
+- PSR-3 logging and PSR-14 events
+
+Receive Maximum (20), Topic Alias Maximum (10) and Server Keep Alive (60s) are fixed
+server-side values, not configurable.
 
 ## Development (DDEV)
 
@@ -437,12 +448,13 @@ ddev exec supervisorctl tail mqtt-broker
 
 ```
 src/
-├── Auth/                  # Authentication interfaces and implementations
+├── Auth/                  # AuthenticatorInterface, password file, --auth loader
 ├── Connection/            # Connection and ConnectionManager
+├── Event/                 # MessagePublished (PSR-14)
 ├── Exception/             # Protocol and packet exceptions
-├── Handler/               # Packet handling logic
+├── Handler/               # PacketHandler and the QoS InFlightMessageTracker
 ├── Message/               # Retained message store
-├── Protocol/
+├── Protocol/              # Wire primitives, reason-code enums, framing
 │   ├── Packet/            # All 15 MQTT packet types
 │   └── Property/          # MQTT 5.0 property system
 ├── Server/                # ReactPHP server abstraction
@@ -450,6 +462,11 @@ src/
 ├── Subscription/          # Subscription and topic matching
 ├── Broker.php             # Main orchestrator
 └── Configuration.php      # Broker configuration
+
+bin/                       # mqtt-broker, mqtt-passwd
+deploy/                    # systemd units, fail2ban filter and jail
+docs/                      # embedding.md
+tools/                     # run_paho.py, for the conformance suites
 ```
 
 ## License
