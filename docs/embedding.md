@@ -229,9 +229,153 @@ permits everything — with one exception: it refuses subscriptions to
 `test/nosubscribe`, an affordance for the MQTT conformance suite. Harmless, but
 surprising if you ever wonder why that one topic behaves differently.
 
+## Error handling
+
+### What `start()` throws
+
+`start()` validates the TLS material before binding, and throws plain
+`\RuntimeException` in four cases: the certificate is unreadable, the key is
+unreadable, `tlsRequireClientCert` is set without `tlsClientCaPath`, or the CA bundle
+is unreadable. Refusing to start is deliberate — a `tls://` listener without usable
+material accepts nothing, and failing every handshake silently is worse than stopping.
+
+```php
+try {
+    $broker->start();
+} catch (\RuntimeException $e) {
+    // misconfiguration: report it and exit, do not retry
+}
+```
+
+With TLS disabled there is nothing to validate, so a plaintext broker does not throw
+from this path.
+
+### What never reaches you
+
+Client-caused protocol failures are contained per connection. A malformed packet or a
+protocol violation is logged at `warning` and closes only the offending connection;
+anything else that escapes packet handling is caught by a `\Throwable` backstop and
+closes that one connection too. The reasoning is in the source: the broker is a single
+process with one event loop, so an exception reaching the loop would drop every
+connected client.
+
+So `MalformedPacketException` and `ProtocolViolationException` are internal. You do not
+need to catch them, and you cannot use them to detect a bad client — watch the log
+instead.
+
+### What does reach you: event listeners
+
+This is the one gap in that containment, and it is worth knowing before you attach a
+listener.
+
+Event dispatch has no try/catch of its own. A listener that throws propagates up
+through packet handling and hits the same backstop as any other unexpected error — so
+**a throwing listener closes the connection of the client whose message triggered it**.
+The client sees a dropped connection; your listener's bug is logged as an unexpected
+error against that client.
+
+Listeners also run synchronously inside the event loop. A listener that makes a slow
+HTTP call stalls the entire broker for its duration, because there is nothing else
+running to take over.
+
+Both follow from the same design, so the rule is simple: wrap listener bodies in your
+own try/catch, and hand slow work to a queue rather than doing it inline.
+
+```php
+$dispatcher->addListener(MessagePublished::class, function (MessagePublished $event): void {
+    try {
+        $this->queue->push($event->topic, $event->payload);
+    } catch (\Throwable $e) {
+        $this->logger->error('listener failed', ['exception' => $e]);
+    }
+});
+```
+
+Contrast with authenticators, which are wrapped: a throwing authenticator denies
+access and is logged. Listeners get no such treatment.
+
+## Events
+
+Pass any PSR-14 dispatcher as `eventDispatcher:` to observe broker activity:
+
+```php
+use PhpMqtt\Broker\Event\MessagePublished;
+
+$broker = new Broker(
+    config: new Configuration(),
+    eventDispatcher: $dispatcher,
+);
+$broker->start();
+```
+
+One event exists today, `PhpMqtt\Broker\Event\MessagePublished`, with six readonly
+properties: `topic`, `payload`, `qos`, `retain`, `clientId` and `timestamp`.
+
+For QoS 0 and 1 it fires as the PUBLISH arrives. For QoS 2 it fires once, on PUBREL,
+when the publisher confirms delivery — so a message is never reported twice, and never
+before the sender has committed to it. It is not dispatched for a publish the
+authenticator denied, nor for will messages, which the broker sends on a client's
+behalf rather than receiving.
+
+**It is an observation hook, not an interception hook.** The dispatcher's return value
+is discarded and the event is not stoppable, so a listener cannot veto or modify a
+message. By the time it fires, the retained store has been updated and any PUBACK
+already sent; only routing to subscribers is still ahead.
+
+## Inspecting a running broker
+
+Three getters expose the broker's live state — useful for a health endpoint or an
+admin view:
+
+```php
+$broker->getConnectionManager()->count();        // connected clients
+$broker->getSubscriptionManager();               // subscription table
+$broker->getPacketHandler()->getRetainedMessages();
+$broker->getPacketHandler()->getSessionManager();
+```
+
+These return the live objects, not copies. Read them; do not mutate them from outside
+the loop.
+
+## Testing without sockets
+
+`Broker` takes a `ServerInterface`, and connections arrive as `ConnectionStream` — both
+small enough to implement directly, which is how the broker's own tests drive it
+without opening a port.
+
+```php
+interface ServerInterface
+{
+    public function listen(string $uri, callable $onConnection, array $context = []): void;
+
+    public function stop(): void;
+
+    public function getLoop(): \React\EventLoop\LoopInterface;
+}
+
+interface ConnectionStream
+{
+    public function write(string $data): void;
+
+    public function close(): void;
+
+    public function onData(callable $handler): void;
+
+    public function onClose(callable $handler): void;
+
+    public function getRemoteAddress(): string;
+}
+```
+
+`tests/Unit/Handler/RecordingStream.php` is a complete worked example in 41 lines: it
+collects writes into an array, records whether it was closed, and leaves `onData()` and
+`onClose()` as empty stubs — a double driven by the test rather than by a socket has
+nothing to register. Assertions then read what the broker wrote, decoded back into
+packets.
+
+The same shape gives you an alternative transport. Implement both interfaces over
+WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
+
 ## Still to come
 
-Sections being written, in this document:
-
-- **Error handling** — what `start()` throws, and which exceptions reach your code.
 - **Configuration reference** — all 21 options, most of which the CLI cannot set.
