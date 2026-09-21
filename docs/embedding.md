@@ -421,6 +421,7 @@ $config = new Configuration(
 | `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic or filter. |
 | `maxRetainedMessages` | `int` | `10000` | Distinct retained topics. |
 | `maxRetainedBytes` | `int` | `67108864` | Total retained payload bytes — the real memory bound, since everything is in-process. |
+| `retainedStatePath` | `?string` | `null` | File the retained messages are kept in across restarts (`--state-file` on the CLI). Written a few seconds after they change and on `stop()`, read back in `start()`; its directory must be writable or `start()` refuses. Null keeps them in memory only. |
 
 ### TLS
 

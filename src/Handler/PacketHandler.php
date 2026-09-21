@@ -618,8 +618,14 @@ final class PacketHandler
         if ($packet->retain) {
             if ($packet->payload === '') {
                 $this->retainedMessages->remove($packet->topicName);
-            } else {
-                $this->retainedMessages->store($packet->topicName, $packet);
+            } elseif (!$this->retainedMessages->store($packet->topicName, $packet)) {
+                // Silently dropping a retain is what a client would take for a
+                // broker that does not support them; the operator should know
+                // it is a limit instead.
+                $this->logger->warning('Retained message on {topic} from {clientId} dropped: retained limits reached', [
+                    'topic' => $packet->topicName,
+                    'clientId' => $clientId,
+                ]);
             }
         }
 

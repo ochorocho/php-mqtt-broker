@@ -14,6 +14,9 @@ final class RetainedMessageStore
 
     private int $totalBytes = 0;
 
+    /** Whether anything changed since the store was last written out. */
+    private bool $dirty = false;
+
     /**
      * Retained messages persist until overwritten, so without bounds any client can
      * pin unlimited attacker-chosen data in memory for the life of the process.
@@ -43,6 +46,7 @@ final class RetainedMessageStore
 
         $this->messages[$topic] = $packet;
         $this->totalBytes += $delta;
+        $this->dirty = true;
 
         return true;
     }
@@ -53,7 +57,29 @@ final class RetainedMessageStore
         if ($existing !== null) {
             $this->totalBytes -= strlen($existing->payload);
             unset($this->messages[$topic]);
+            $this->dirty = true;
         }
+    }
+
+    /**
+     * Every retained message, keyed by topic. For writing the store out.
+     *
+     * @return array<string, PublishPacket>
+     */
+    public function all(): array
+    {
+        return $this->messages;
+    }
+
+    public function isDirty(): bool
+    {
+        return $this->dirty;
+    }
+
+    /** Called once the store has been written out, or filled from a file. */
+    public function markClean(): void
+    {
+        $this->dirty = false;
     }
 
     public function count(): int

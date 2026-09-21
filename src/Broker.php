@@ -11,6 +11,7 @@ use PhpMqtt\Broker\Connection\ConnectionManager;
 use PhpMqtt\Broker\Exception\MalformedPacketException;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
 use PhpMqtt\Broker\Handler\PacketHandler;
+use PhpMqtt\Broker\Message\RetainedStateFile;
 use PhpMqtt\Broker\Protocol\PacketEncoder;
 use PhpMqtt\Broker\Protocol\PacketFactory;
 use PhpMqtt\Broker\Server\ConnectionStream;
@@ -23,6 +24,9 @@ use Psr\Log\NullLogger;
 
 final class Broker
 {
+    /** Seconds between writes of the retained state while it keeps changing. */
+    private const float RETAINED_FLUSH_INTERVAL = 5.0;
+
     private readonly ConnectionManager $connectionManager;
     private readonly SubscriptionManager $subscriptionManager;
     private readonly PacketFactory $packetFactory;
@@ -58,6 +62,8 @@ final class Broker
         // Refuse to start rather than bind a TLS listener that cannot complete a
         // handshake; a broker that silently serves nobody is worse than one that stops.
         $this->config->validateTls();
+        $this->config->validateRetainedState();
+        $this->restoreRetained();
 
         $uri = $this->config->getListenUri();
         $this->logger->info('MQTT Broker starting on {uri}', [
@@ -90,12 +96,37 @@ final class Broker
             }
         });
 
+        // Written when something changed, on a short cadence: a crash under a
+        // service manager's restart loses at most this window, and a clean stop
+        // writes once more below.
+        if ($this->config->retainedStatePath !== null) {
+            $this->server->getLoop()->addPeriodicTimer(self::RETAINED_FLUSH_INTERVAL, function (): void {
+                try {
+                    $this->flushRetained();
+                } catch (\Throwable $e) {
+                    $this->logger->error('Writing the retained state failed: {error}', [
+                        'error' => $e->getMessage(),
+                        'exception' => $e,
+                    ]);
+                }
+            });
+        }
+
         $this->server->getLoop()->run();
     }
 
     public function stop(): void
     {
         $this->logger->info('MQTT Broker stopping');
+
+        try {
+            $this->flushRetained();
+        } catch (\Throwable $e) {
+            $this->logger->error('Writing the retained state on stop failed: {error}', [
+                'error' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+        }
 
         foreach ($this->connectionManager->getAll() as $connection) {
             $connection->close();
@@ -214,6 +245,65 @@ final class Broker
 
         $this->logger->debug('Connection closed: {client}', [
             'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
+        ]);
+    }
+
+    /**
+     * Fill the retained store from the state file, when one is configured.
+     *
+     * The limits apply as they would to a client publishing the same messages,
+     * so a file written under looser limits cannot pin more than the current
+     * configuration allows.
+     */
+    private function restoreRetained(): void
+    {
+        if ($this->config->retainedStatePath === null) {
+            return;
+        }
+
+        $store = $this->packetHandler->getRetainedMessages();
+        $restored = 0;
+        $rejected = 0;
+        foreach ((new RetainedStateFile($this->config->retainedStatePath))->read($this->logger) as $packet) {
+            if ($store->store($packet->topicName, $packet)) {
+                $restored++;
+            } else {
+                $rejected++;
+            }
+        }
+        // Nothing here needs writing back; the file is what was just read.
+        $store->markClean();
+
+        $this->logger->info('Restored {count} retained message(s) from {path}', [
+            'count' => $restored,
+            'path' => $this->config->retainedStatePath,
+        ]);
+        if ($rejected > 0) {
+            $this->logger->warning('{count} retained message(s) in {path} exceed the configured limits and were dropped', [
+                'count' => $rejected,
+                'path' => $this->config->retainedStatePath,
+            ]);
+        }
+    }
+
+    /**
+     * Write the retained store out, when one is configured and something changed.
+     *
+     * @throws \RuntimeException when the file cannot be written.
+     */
+    private function flushRetained(): void
+    {
+        $store = $this->packetHandler->getRetainedMessages();
+        if ($this->config->retainedStatePath === null || !$store->isDirty()) {
+            return;
+        }
+
+        $written = (new RetainedStateFile($this->config->retainedStatePath))->write($store);
+        $store->markClean();
+
+        $this->logger->debug('Wrote {count} retained message(s) to {path}', [
+            'count' => $written,
+            'path' => $this->config->retainedStatePath,
         ]);
     }
 }

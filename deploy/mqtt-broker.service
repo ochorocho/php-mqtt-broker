@@ -19,12 +19,16 @@ Group=mqtt
 # --tls-cert is what makes the single listener a TLS one. The broker is one
 # process with one listener, so there is no plaintext port to firewall off as
 # long as this flag is present.
+# --state-file keeps the retained messages across restarts, including the one
+# a certificate renewal triggers. StateDirectory= below creates /var/lib/mqtt
+# owned by the service user and is the one place the broker may write.
 ExecStart=/usr/bin/php /opt/mqtt-broker/bin/mqtt-broker \
   --host=0.0.0.0 \
   --port=8883 \
   --tls-cert=/etc/mqtt/tls/server.crt \
   --tls-key=/etc/mqtt/tls/server.key \
-  --password-file=/etc/mqtt/passwd
+  --password-file=/etc/mqtt/passwd \
+  --state-file=/var/lib/mqtt/retained.ndjson
 
 Restart=on-failure
 RestartSec=5s
@@ -41,12 +45,14 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 
 # --- Filesystem ------------------------------------------------------------
-# The broker writes nothing: all state is in memory and the password file is
-# read once at startup. So the whole filesystem can be read-only, which is what
-# stops a compromised process from editing its own auth.php for persistence.
+# The broker writes exactly one thing, the retained state file, and reads the
+# password file once at startup. So the whole filesystem is read-only except
+# the state directory, which is what stops a compromised process from editing
+# its own auth.php for persistence.
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/etc/mqtt /opt/mqtt-broker
+StateDirectory=mqtt
 PrivateTmp=true
 PrivateDevices=true
 UMask=0077

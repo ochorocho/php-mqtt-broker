@@ -36,6 +36,7 @@ $options = getopt('', [
     'password-file:',
     'auth:',
     'allow-any-client-id',
+    'state-file:',
     'help',
 ]);
 
@@ -60,6 +61,12 @@ if ($flag('help')) {
       --allow-any-client-id    With --password-file, stop requiring a client ID to
                                belong to the account that authenticated. Only for
                                clients whose ID is unrelated to their username.
+
+    State:
+      --state-file=PATH        Keep retained messages in this file, so they survive
+                               a restart. Written a few seconds after they change
+                               and on shutdown; its directory must be writable.
+                               Without it, a restart drops every retained message.
 
     TLS:
       --tls-cert=PATH          Server certificate (enables TLS)
@@ -109,6 +116,7 @@ $config = new Configuration(
     tlsKeyPassphrase: $str('tls-passphrase'),
     tlsRequireClientCert: $flag('tls-require-client-cert'),
     tlsClientCaPath: $str('tls-client-ca'),
+    retainedStatePath: $str('state-file'),
 );
 
 $logger = new class extends \Psr\Log\AbstractLogger {

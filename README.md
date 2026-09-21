@@ -34,8 +34,14 @@ The broker listens on `0.0.0.0:1883` by default and accepts anyone. Options:
 ```bash
 php bin/mqtt-broker --host=127.0.0.1 --port=1884
 php bin/mqtt-broker --password-file=/etc/mqtt/passwd   # require credentials
+php bin/mqtt-broker --state-file=/var/lib/mqtt/retained.ndjson  # keep retained messages across restarts
 php bin/mqtt-broker --help                             # every option
 ```
+
+Retained messages live in memory unless `--state-file` names a file for them:
+then they are written there a few seconds after they change and on shutdown,
+and read back at the next start, so a restart no longer forgets what every
+device announced. Sessions and queued offline messages are still memory only.
 
 Signal handling (SIGINT/SIGTERM) is supported when the `pcntl` extension is available.
 
@@ -326,8 +332,9 @@ It is marked experimental at the top of this README, and these gaps are real:
   debugging it, within seconds of a rollout.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
-- **Most limits are unreachable from the CLI.** Only 7 of `Configuration`'s 21
-  options have flags — `host`, `port` and the five `--tls-*` ones. The other 14,
+- **Most limits are unreachable from the CLI.** Only 8 of `Configuration`'s 22
+  options have flags — `host`, `port`, `--state-file` and the five `--tls-*`
+  ones. The other 14,
   including every `max*` limit and `connectTimeout`, require constructing
   `Configuration` in your own entrypoint; see the
   [configuration reference](docs/embedding.md#configuration-reference). Until then,
@@ -335,8 +342,9 @@ It is marked experimental at the top of this README, and these gaps are real:
 - **`PasswordFileAuthenticator` grants every account full topic access**, so one
   leaked credential can subscribe to `#`. Use `--auth` with per-topic rules when
   accounts should not be equals.
-- **All state is in memory.** A restart — including one triggered by certificate
-  renewal — drops retained messages and queued offline messages.
+- **Sessions are in memory.** A restart — including one triggered by certificate
+  renewal — drops persistent sessions and their queued offline messages. Retained
+  messages survive it only when `--state-file` is set; without it they go too.
 
 Failed logins are visible, but visibility is not a brake: the broker will answer
 the next attempt just as quickly. So the effective control remains keeping the
@@ -400,7 +408,7 @@ authenticated form, and use `-p 11883` under DDEV.
 
 - MQTT 3.1.1 and 5.0 protocol support
 - QoS 0, 1, and 2
-- Retained messages
+- Retained messages, kept across restarts with `--state-file`
 - Will messages (including Will Delay Interval for MQTT 5.0)
 - Session persistence and offline message queueing
 - Topic wildcards (`+` single-level, `#` multi-level)

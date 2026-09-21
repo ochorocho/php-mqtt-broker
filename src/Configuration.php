@@ -34,6 +34,9 @@ final class Configuration
      * @param int $tlsMinVersion Minimum protocol, as an OpenSSL crypto-method
      *                           constant. Defaults to TLS 1.2 or better; PHP's own
      *                           default would still negotiate TLS 1.0 on some builds.
+     * @param ?string $retainedStatePath File the retained messages are kept in
+     *                                   across restarts. Null keeps them in memory
+     *                                   only, where a restart drops them.
      */
     public function __construct(
         public readonly string $host = '0.0.0.0',
@@ -57,7 +60,36 @@ final class Configuration
         public readonly ?string $tlsClientCaPath = null,
         public readonly ?string $tlsCiphers = null,
         public readonly int $tlsMinVersion = STREAM_CRYPTO_METHOD_TLSv1_2_SERVER,
+        public readonly ?string $retainedStatePath = null,
     ) {
+    }
+
+    /**
+     * @throws \RuntimeException when a state file is configured but cannot be used.
+     */
+    public function validateRetainedState(): void
+    {
+        if ($this->retainedStatePath === null) {
+            return;
+        }
+
+        // Refusing to start is the right outcome here as well: a broker told to
+        // keep its retained messages and quietly unable to would forget them on
+        // the next restart, which is the failure the option exists to end.
+        $directory = dirname($this->retainedStatePath);
+        if (!is_dir($directory) || !is_writable($directory)) {
+            throw new \RuntimeException(sprintf(
+                'Retained state directory is not writable: %s',
+                $directory,
+            ));
+        }
+
+        if (file_exists($this->retainedStatePath) && !is_readable($this->retainedStatePath)) {
+            throw new \RuntimeException(sprintf(
+                'Retained state file is not readable: %s',
+                $this->retainedStatePath,
+            ));
+        }
     }
 
     public function isTlsEnabled(): bool
