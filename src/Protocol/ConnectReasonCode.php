@@ -28,5 +28,6 @@ enum ConnectReasonCode: int
     case BadUserNameOrPassword = 0x86;
     case NotAuthorized = 0x87;
     case BadAuthenticationMethod = 0x8C;
+    case TopicNameInvalid = 0x90;
     case ConnectionRateExceeded = 0x9F;
 }

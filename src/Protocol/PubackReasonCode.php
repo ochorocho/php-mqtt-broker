@@ -16,4 +16,5 @@ enum PubackReasonCode: int
     case NoMatchingSubscribers = 0x10;
     case UnspecifiedError = 0x80;
     case NotAuthorized = 0x87;
+    case TopicNameInvalid = 0x90;
 }

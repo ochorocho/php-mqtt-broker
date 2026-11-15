@@ -424,7 +424,7 @@ WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
 ## Configuration reference
 
-`Configuration` is a value object: 29 constructor parameters, all with defaults, all
+`Configuration` is a value object: 30 constructor parameters, all with defaults, all
 readonly. **Only nine are reachable from the CLI** — `host`, `port`, `--state-file`
 and the six `--tls-*` options. The others can only be set by constructing it
 yourself, which is the main reason to embed the broker rather than run the binary.
@@ -470,7 +470,8 @@ $config = new Configuration(
 |---|---|---|---|
 | `maxSubscriptionsPerClient` | `int` | `1000` | Active subscriptions per client. |
 | `maxFiltersPerSubscribe` | `int` | `128` | Topic filters acted on in one SUBSCRIBE; the rest are refused (`0x80`, or `0x97` Quota exceeded in 5.0). A filter named twice in one packet has its retained messages sent once. |
-| `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic or filter. |
+| `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic name or filter — subscriptions, published topics, will topics and restored retained topics alike. A shared filter is counted behind its `$share/<group>/` prefix. |
+| `maxTopicLength` | `int` | `4096` | Bytes in a topic name or filter, wherever one enters the broker. MQTT itself allows 65535, at which one client's thousand subscriptions are 64 MiB of routing table. A PUBLISH over either limit is refused (`0x90` Topic Name invalid in 5.0, acknowledged and dropped in 3.1.1); a filter gets `0x80`; a will refuses the CONNECT. |
 | `maxRetainedMessages` | `int` | `10000` | Distinct retained topics. |
 | `maxRetainedBytes` | `int` | `67108864` | Total retained bytes, counting each message's topic name, payload and properties — the real memory bound, since everything is in-process. Only properties that travel with a message (payload format, content type, response topic, correlation data, user properties, message expiry) are retained; a topic alias or authentication data is dropped. |
 | `retainedStatePath` | `?string` | `null` | File the retained messages are kept in across restarts (`--state-file` on the CLI). Written a few seconds after they change and on `stop()`, read back in `start()`; its directory must be writable or `start()` refuses. Null keeps them in memory only. |

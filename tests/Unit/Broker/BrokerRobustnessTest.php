@@ -150,4 +150,25 @@ final class BrokerRobustnessTest extends BrokerTestCase
             static fn(string $line): bool => str_contains($line, 'outbound buffer'),
         ));
     }
+
+    public function testRestoredRetainedTopicsAreHeldToTheTopicLimits(): void
+    {
+        $directory = sys_get_temp_dir() . '/mqtt-limits-' . bin2hex(random_bytes(4));
+        mkdir($directory);
+        $path = $directory . '/retained.ndjson';
+        file_put_contents($path, implode("\n", [
+            json_encode(['t' => str_repeat('t', 50), 'p' => base64_encode('x'), 'q' => 0, 'v' => 4]),
+            json_encode(['t' => 'ok', 'p' => base64_encode('y'), 'q' => 0, 'v' => 4]),
+        ]) . "\n");
+
+        try {
+            // A file written under looser limits must not pin more than these allow.
+            $this->startBroker(new Configuration(maxTopicLength: 20, retainedStatePath: $path));
+
+            self::assertSame(['ok'], array_keys($this->broker->getPacketHandler()->getRetainedMessages()->all()));
+        } finally {
+            @unlink($path);
+            @rmdir($directory);
+        }
+    }
 }

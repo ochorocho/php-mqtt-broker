@@ -316,7 +316,7 @@ final class Broker
         $restored = 0;
         $rejected = 0;
         foreach ((new RetainedStateFile($this->config->retainedStatePath))->read($this->logger) as $packet) {
-            if ($store->store($packet->topicName, $packet)) {
+            if (!$this->config->exceedsTopicLimits($packet->topicName) && $store->store($packet->topicName, $packet)) {
                 $restored++;
             } else {
                 $rejected++;

@@ -293,6 +293,25 @@ final class PacketHandler
             return;
         }
 
+        // A will is published like any message, so its topic has to be one a client could
+        // publish to: no wildcard, within the limits. It was never checked at all.
+        if ($packet->hasWill && $packet->willTopic !== null
+            && (!TopicFilter::isValidName($packet->willTopic) || $this->config->exceedsTopicLimits($packet->willTopic))
+        ) {
+            $this->logger->debug('CONNECT from {address} refused: will topic is not a valid topic name', [
+                'address' => LogSanitizer::address($connection->getRemoteAddress()),
+            ]);
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::TopicNameInvalid->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
         $clientId = $packet->clientId;
         if ($clientId === '') {
             if ($version === ProtocolVersion::V50) {
@@ -664,6 +683,15 @@ final class PacketHandler
             return;
         }
 
+        // Before anything keeps the topic - an alias registration, the retained store.
+        if ($packet->topicName !== '' && $this->config->exceedsTopicLimits($packet->topicName)) {
+            $this->logger->debug('Publish from {clientId} refused: topic exceeds the configured limits', [
+                'clientId' => LogSanitizer::forLog($clientId),
+            ]);
+            $this->acknowledgeRefusedPublish($connection, $packet, PubackReasonCode::TopicNameInvalid);
+            return;
+        }
+
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->properties !== null) {
             $topicAlias = $packet->properties->get(PropertyId::TopicAlias);
             if ($topicAlias !== null) {
@@ -926,7 +954,7 @@ final class PacketHandler
 
             // Bound trie growth: deep filters and unlimited subscriptions per client are
             // both cheap ways to allocate nodes that used to be kept for the process life.
-            if (substr_count($topic, '/') + 1 > $this->config->maxTopicLevels) {
+            if ($this->config->exceedsTopicLimits($topic)) {
                 $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
@@ -1216,19 +1244,28 @@ final class PacketHandler
      */
     private function rejectPublish(Connection $connection, PublishPacket $packet): void
     {
-        $version = $connection->getProtocolVersion();
-        $isV5 = $version === ProtocolVersion::V50;
-
         $this->logger->warning('Publish denied for {clientId} on {topic}', [
             'clientId' => LogSanitizer::forLog($connection->getClientId() ?? ''),
             'topic' => LogSanitizer::forLog($packet->topicName),
         ]);
 
+        $this->acknowledgeRefusedPublish($connection, $packet, PubackReasonCode::NotAuthorized);
+    }
+
+    /**
+     * Answer a PUBLISH that will not be routed. 5.0 can say why; 3.1.1 cannot signal a
+     * refusal at all, so the packet is acknowledged normally and dropped.
+     */
+    private function acknowledgeRefusedPublish(Connection $connection, PublishPacket $packet, PubackReasonCode $reason): void
+    {
+        $version = $connection->getProtocolVersion();
+        $reasonCode = $version === ProtocolVersion::V50 ? $reason->value : PubackReasonCode::Success->value;
+
         if ($packet->qos === 1 && $packet->packetId !== null) {
             $connection->send(new PubackPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
+                reasonCode: $reasonCode,
             ));
         }
 
@@ -1236,7 +1273,7 @@ final class PacketHandler
             $connection->send(new PubrecPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
+                reasonCode: $reasonCode,
             ));
         }
     }

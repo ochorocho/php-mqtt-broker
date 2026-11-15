@@ -363,9 +363,9 @@ It is marked experimental at the top of this README, and these gaps are real:
   debugging it, within seconds of a rollout.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
-- **Most limits are unreachable from the CLI.** Only 9 of `Configuration`'s 29
+- **Most limits are unreachable from the CLI.** Only 9 of `Configuration`'s 30
   options have flags — `host`, `port`, `--state-file` and the six `--tls-*`
-  ones. The other 20,
+  ones. The other 21,
   including every `max*` limit and `connectTimeout`, require constructing
   `Configuration` in your own entrypoint; see the
   [configuration reference](docs/embedding.md#configuration-reference). Until then,

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker;
 
 use PhpMqtt\Broker\Protocol\PacketStream;
+use PhpMqtt\Broker\Protocol\TopicFilter;
 
 final class Configuration
 {
@@ -25,7 +26,8 @@ final class Configuration
      * @param int $maxRetainedBytes Total retained bytes: topic names, payloads and
      *                              properties.
      * @param int $maxSubscriptionsPerClient Active subscriptions per client.
-     * @param int $maxTopicLevels Levels ('/'-separated) in a topic or filter.
+     * @param int $maxTopicLevels Levels ('/'-separated) in a topic name or filter; for a
+     *                            shared filter, in the filter behind `$share/<group>/`.
      * @param int $maxClientIdLength Client identifier length in bytes.
      * @param ?string $tlsKeyPassphrase Passphrase for an encrypted private key.
      * @param bool $tlsRequireClientCert Require and verify a client certificate
@@ -53,6 +55,9 @@ final class Configuration
      *                                    within $authFailureWindow before further attempts
      *                                    are refused without being checked. 0 disables.
      * @param float $authFailureWindow Seconds a failed login counts against its host.
+     * @param int $maxTopicLength Bytes in a topic name or filter. MQTT allows 65535; one
+     *                            client's thousand subscriptions at that length are
+     *                            64 MiB of routing table.
      * @param bool $tlsIdentityAsUsername Use the common name of the verified client
      *                                    certificate as the username, whatever CONNECT
      *                                    says. Needs $tlsRequireClientCert.
@@ -87,7 +92,22 @@ final class Configuration
         public readonly int $maxAuthFailuresPerHost = 10,
         public readonly float $authFailureWindow = 60.0,
         public readonly bool $tlsIdentityAsUsername = false,
+        public readonly int $maxTopicLength = 4096,
     ) {
+    }
+
+    /**
+     * Whether a topic name or filter is longer or deeper than this broker accepts.
+     * Levels are counted behind a shared subscription's `$share/<group>/` prefix,
+     * which says who receives a message, not where it was published.
+     */
+    public function exceedsTopicLimits(string $topicOrFilter): bool
+    {
+        if (strlen($topicOrFilter) > $this->maxTopicLength) {
+            return true;
+        }
+
+        return substr_count(TopicFilter::stripSharedPrefix($topicOrFilter), '/') + 1 > $this->maxTopicLevels;
     }
 
     /**
