@@ -6,6 +6,7 @@ namespace PhpMqtt\Broker\Handler;
 
 use PhpMqtt\Broker\Auth\AuthFailureThrottle;
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
+use PhpMqtt\Broker\Auth\DeliveryAuthorizerInterface;
 use PhpMqtt\Broker\Configuration;
 use PhpMqtt\Broker\Connection\Connection;
 use PhpMqtt\Broker\Connection\ConnectionManager;
@@ -1440,6 +1441,18 @@ final class PacketHandler
      */
     private function sendPublish(Connection $connection, PublishPacket $packet, string $clientId): void
     {
+        // Every PUBLISH to a live connection passes here - live, retained, queued and
+        // replayed alike - so this is the one place a per-delivery veto has to sit.
+        $authorizer = $this->authenticator;
+        if ($authorizer instanceof DeliveryAuthorizerInterface && !$this->authorize(
+            fn(): bool => $authorizer->canReceive($clientId, $connection->getUsername(), $packet->topicName),
+            'canReceive',
+            $clientId,
+            $packet->topicName,
+        )) {
+            return;
+        }
+
         $version = $connection->getProtocolVersion();
         if ($packet->protocolVersion !== $version) {
             $packet = new PublishPacket(

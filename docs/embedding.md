@@ -143,6 +143,7 @@ parameter, and can drop the map.
 | `canUseClientId()` | Once per connection, immediately after `authenticate()` succeeds. Not for an ID the broker assigned itself (the client sent an empty one): those are random and belong to no account |
 | `canSubscribe()` | Per topic filter in every SUBSCRIBE — **and again for every restored subscription when a client reconnects to a persistent session** |
 | `canPublish()` | Per inbound PUBLISH, plus once on the will topic at connect, plus again when a will is actually published |
+| `canReceive()` | Only if the authenticator implements `DeliveryAuthorizerInterface`: per message, per subscriber, just before it is sent |
 
 The session-restore case surprises people. A client reconnecting with
 `cleanSession: false` re-authorizes each of its stored subscriptions, so an
@@ -159,6 +160,31 @@ the client was connected.
 The broker throttles hosts that keep failing, but a check that succeeds is paid in
 full each time: remember a verified password — as a keyed hash, never the password —
 the way `PasswordFileAuthenticator` does.
+
+### Vetoing individual deliveries
+
+`canSubscribe()` is asked once per filter. Grant `sensors/#` and every topic beneath it
+is delivered for as long as the subscription lasts, so an authorizer that only checks
+filters has to reason about everything a wildcard could ever match.
+
+An authenticator that also implements `DeliveryAuthorizerInterface` is asked instead
+about each message, for each subscriber it is about to go to:
+
+```php
+interface DeliveryAuthorizerInterface
+{
+    public function canReceive(string $clientId, ?string $username, string $topicName): bool;
+}
+```
+
+It is consulted for live deliveries, for retained messages on subscribe, and for queued
+messages when they finally go out — so access revoked while a client was offline
+holds when it returns. A denied message is dropped for that subscriber only; the
+publisher is told nothing. It fails closed like every other check.
+
+It runs once per message per subscriber, on the broker's only thread. Answer it from
+memory — say, a rule set loaded in `authenticate()` per username — rather than from a
+database call.
 
 ### Failures deny rather than crash
 
@@ -240,7 +266,7 @@ it does not cache successful logins, which a busy deployment should.
 
 Without an `authenticator:` argument the broker uses `AllowAllAuthenticator`, which
 permits everything — with one exception: it refuses subscriptions to
-`test/nosubscribe`, an affordance for the MQTT conformance suite. Harmless, but
+`test/nosubscribe` (shared ones included), an affordance for the MQTT conformance suite. Harmless, but
 surprising if you ever wonder why that one topic behaves differently.
 
 ## Error handling

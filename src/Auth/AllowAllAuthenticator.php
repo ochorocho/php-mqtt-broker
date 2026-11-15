@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Auth;
 
+use PhpMqtt\Broker\Protocol\TopicFilter;
+
 final class AllowAllAuthenticator implements AuthenticatorInterface
 {
     /** @var string[] Topic filters that are denied for subscription */
@@ -24,7 +26,9 @@ final class AllowAllAuthenticator implements AuthenticatorInterface
 
     public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool
     {
-        return !in_array($topicFilter, $this->noSubscribeTopics, true);
+        // '$share/<group>/' changes who receives a message, not which messages: compare
+        // the filter behind it, or the prefix walks straight past the list.
+        return !in_array(TopicFilter::stripSharedPrefix($topicFilter), $this->noSubscribeTopics, true);
     }
 
     public function canPublish(string $clientId, ?string $username, string $topicName): bool
