@@ -48,6 +48,10 @@ final class Configuration
      * @param int $maxInflightMessages QoS 1/2 messages sent to a client and not yet
      *                                 acknowledged. Applied to 3.1.1 clients, which have
      *                                 no Receive Maximum, and caps a 5.0 client's own.
+     * @param int $maxAuthFailuresPerHost Failed logins tolerated from one remote address
+     *                                    within $authFailureWindow before further attempts
+     *                                    are refused without being checked. 0 disables.
+     * @param float $authFailureWindow Seconds a failed login counts against its host.
      */
     public function __construct(
         public readonly string $host = '0.0.0.0',
@@ -76,6 +80,8 @@ final class Configuration
         public readonly int $maxOutboundBufferBytes = 8 * 1024 * 1024,
         public readonly int $maxConnectPacketSize = 64 * 1024,
         public readonly int $maxInflightMessages = 64,
+        public readonly int $maxAuthFailuresPerHost = 10,
+        public readonly float $authFailureWindow = 60.0,
     ) {
     }
 

@@ -28,14 +28,14 @@ passed to authorization, no accidental anonymous broker.
 **Success Criteria**: Success cache, per-host throttle, longest-owner rule, new
 authorizer signatures, `--allow-anonymous` required.
 **Tests**: PasswordFileAuthenticatorTest, AuthFailureThrottleTest, PacketHandlerAuthorizationTest
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 4: Purge expired sessions (H6)
 **Goal**: A session that expires or is evicted takes its subscriptions with it.
 **Success Criteria**: Expired filters stop matching; reconnect after expiry gets nothing;
 live sessions survive the reaper.
 **Tests**: PacketHandlerLifecycleTest additions, SessionManagerTest
-**Status**: Not Started
+**Status**: In Progress
 
 ## Stage 5: TLS handshake deadline (H5)
 **Goal**: A socket that never completes the TLS handshake is closed.

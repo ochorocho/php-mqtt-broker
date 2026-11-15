@@ -62,7 +62,7 @@ jobs:
 
       - name: Start MQTT broker
         run: |
-          php bin/mqtt-broker 2>broker.log &
+          php bin/mqtt-broker --allow-anonymous 2>broker.log &
           echo $! > broker.pid
           for i in $(seq 1 30); do
             if nc -z localhost 1883 2>/dev/null; then

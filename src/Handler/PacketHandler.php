@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Handler;
 
+use PhpMqtt\Broker\Auth\AuthFailureThrottle;
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
 use PhpMqtt\Broker\Configuration;
 use PhpMqtt\Broker\Connection\Connection;
@@ -55,6 +56,8 @@ final class PacketHandler
 
     private readonly InFlightMessageTracker $inFlight;
 
+    private readonly AuthFailureThrottle $authThrottle;
+
     /** @var array<string, \React\EventLoop\TimerInterface> clientId => will delay timer */
     private array $willDelayTimers = [];
 
@@ -77,6 +80,10 @@ final class PacketHandler
         );
         $this->sessionManager = new SessionManager(maxSessions: $this->config->maxSessions);
         $this->inFlight = new InFlightMessageTracker();
+        $this->authThrottle = new AuthFailureThrottle(
+            maxFailures: $this->config->maxAuthFailuresPerHost,
+            window: $this->config->authFailureWindow,
+        );
     }
 
     public function getRetainedMessages(): RetainedMessageStore
@@ -264,7 +271,31 @@ final class PacketHandler
                     return;
                 }
                 $clientId = 'auto-' . bin2hex(random_bytes(8));
+                $connection->setAssignedClientId(true);
             }
+        }
+
+        // A host that keeps failing is answered without a password check: each check is
+        // a deliberately slow hash on the broker's only thread, so unthrottled guessing
+        // would stall every client, not just fail to get in.
+        $host = AuthFailureThrottle::hostOf($connection->getRemoteAddress());
+        if ($this->authThrottle->isThrottled($host)) {
+            // Not "Authentication failed": nothing was checked, and the fail2ban filter
+            // must not count the same attacker twice for one refusal.
+            $this->logger->warning('Login throttled for {address} after repeated failures (client {clientId})', [
+                'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                'clientId' => LogSanitizer::forLog($clientId),
+            ]);
+
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::ConnectionRateExceeded->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
         }
 
         if (!$this->authorize(
@@ -272,6 +303,8 @@ final class PacketHandler
             'authenticate',
             $clientId,
         )) {
+            $this->authThrottle->recordFailure($host);
+
             // The only record a rejected login leaves. Without it a guessing run is
             // invisible, and there is nothing for a log-based blocker to match on.
             $this->logger->warning(
@@ -297,7 +330,8 @@ final class PacketHandler
         // Bind the client ID to the authenticated principal before any takeover.
         // Without this, valid credentials allow evicting another client and, for
         // persistent sessions, inheriting its subscriptions and queued messages.
-        if (!$this->authorize(
+        // An ID the broker generated is random and belongs to no account.
+        if (!$connection->isAssignedClientId() && !$this->authorize(
             fn(): bool => $this->authenticator->canUseClientId($clientId, $packet->username),
             'canUseClientId',
             $clientId,
@@ -330,7 +364,7 @@ final class PacketHandler
         // it at CONNECT and silently dropping it at disconnect time.
         if ($packet->hasWill && $packet->willTopic !== null
             && !$this->authorize(
-                fn(): bool => $this->authenticator->canPublish($clientId, $packet->willTopic ?? ''),
+                fn(): bool => $this->authenticator->canPublish($clientId, $packet->username, $packet->willTopic ?? ''),
                 'canPublish(will)',
                 $clientId,
                 $packet->willTopic,
@@ -372,6 +406,7 @@ final class PacketHandler
         }
 
         $connection->setClientId($clientId);
+        $connection->setUsername($packet->username);
         $connection->setConnected(true);
         $connection->setCleanSession($packet->cleanSession);
 
@@ -451,7 +486,7 @@ final class PacketHandler
                 $session->subscriptions = array_values(array_filter(
                     $session->subscriptions,
                     fn($sub): bool => $this->authorize(
-                        fn(): bool => $this->authenticator->canSubscribe($clientId, $sub->topicFilter),
+                        fn(): bool => $this->authenticator->canSubscribe($clientId, $packet->username, $sub->topicFilter),
                         'canSubscribe(restore)',
                         $clientId,
                         $sub->topicFilter,
@@ -616,7 +651,7 @@ final class PacketHandler
         // An empty retained payload deletes the retained message for a topic, so this
         // also gates retained-message destruction.
         if (!$this->authorize(
-            fn(): bool => $this->authenticator->canPublish($clientId, $packet->topicName),
+            fn(): bool => $this->authenticator->canPublish($clientId, $connection->getUsername(), $packet->topicName),
             'canPublish',
             $clientId,
             $packet->topicName,
@@ -820,7 +855,7 @@ final class PacketHandler
             }
 
             if (!$this->authorize(
-                fn(): bool => $this->authenticator->canSubscribe($clientId, $topic),
+                fn(): bool => $this->authenticator->canSubscribe($clientId, $connection->getUsername(), $topic),
                 'canSubscribe',
                 $clientId,
                 $topic,
@@ -1127,7 +1162,7 @@ final class PacketHandler
         // connection was open, or between a delayed will being armed and firing.
         $clientId = $connection->getClientId();
         if ($clientId !== null && !$this->authorize(
-            fn(): bool => $this->authenticator->canPublish($clientId, $willTopic),
+            fn(): bool => $this->authenticator->canPublish($clientId, $connection->getUsername(), $willTopic),
             'canPublish(will)',
             $clientId,
             $willTopic,

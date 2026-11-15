@@ -37,6 +37,7 @@ $options = getopt('', [
     'password-file:',
     'auth:',
     'allow-any-client-id',
+    'allow-anonymous',
     'state-file:',
     'help',
 ]);
@@ -52,13 +53,16 @@ if ($flag('help')) {
       --host=ADDR              Bind address (default 0.0.0.0)
       --port=PORT              Bind port (default 1883, or 8883 with --tls-cert)
 
-    Authentication (optional; without either flag the broker accepts anyone):
+    Authentication (one of these is required):
       --password-file=PATH     Authenticate against a file of hashed credentials.
                                Write it with bin/mqtt-passwd.
       --auth=PATH              Load a PHP file returning an AuthenticatorInterface,
                                for database, LDAP or per-topic rules. The file runs
                                with the broker's privileges: it must be owned by the
                                operator and not writable by the broker user.
+      --allow-anonymous        Accept every client without credentials. Anyone who
+                               can reach the port may then read every topic and take
+                               over any client ID. For development and test rigs.
       --allow-any-client-id    With --password-file, stop requiring a client ID to
                                belong to the account that authenticated. Only for
                                clients whose ID is unrelated to their username.
@@ -92,6 +96,19 @@ $authFile = $str('auth');
 // enforced when a custom authenticator has replaced it.
 if ($passwordFile !== null && $authFile !== null) {
     fwrite(STDERR, "--password-file and --auth are mutually exclusive\n");
+    exit(1);
+}
+
+// An unconfigured broker used to accept anyone, on every interface by default. That
+// has to be a decision, not an omission.
+if ($passwordFile === null && $authFile === null && !$flag('allow-anonymous')) {
+    fwrite(STDERR, "No authentication configured. Pass --password-file or --auth, or --allow-anonymous\n"
+        . "to accept every client without credentials (development only). See --help.\n");
+    exit(1);
+}
+
+if ($flag('allow-anonymous') && ($passwordFile !== null || $authFile !== null)) {
+    fwrite(STDERR, "--allow-anonymous cannot be combined with --password-file or --auth\n");
     exit(1);
 }
 
@@ -163,7 +180,7 @@ echo sprintf(
     match (true) {
         $passwordFile !== null => 'password file: ' . $passwordFile,
         $authFile !== null => 'authenticator: ' . $authFile,
-        default => 'no authentication',
+        default => 'NO AUTHENTICATION, --allow-anonymous',
     },
 );
 

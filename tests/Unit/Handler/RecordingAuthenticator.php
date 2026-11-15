@@ -17,6 +17,9 @@ final class RecordingAuthenticator implements AuthenticatorInterface
     /** @var list<string> */
     public array $calls = [];
 
+    /** @var list<string> "method:username" for every authorization check */
+    public array $authorizedAs = [];
+
     /**
      * @param list<string> $deniedPublishTopics
      * @param list<string> $deniedSubscribeFilters
@@ -39,17 +42,19 @@ final class RecordingAuthenticator implements AuthenticatorInterface
         return $this->authenticateResult;
     }
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool
     {
         $this->calls[] = 'canSubscribe:' . $topicFilter;
+        $this->authorizedAs[] = 'canSubscribe:' . ($username ?? '<none>');
         $this->maybeThrow('canSubscribe');
 
         return !in_array($topicFilter, $this->deniedSubscribeFilters, true);
     }
 
-    public function canPublish(string $clientId, string $topicName): bool
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool
     {
         $this->calls[] = 'canPublish:' . $topicName;
+        $this->authorizedAs[] = 'canPublish:' . ($username ?? '<none>');
         $this->maybeThrow('canPublish');
 
         return !in_array($topicName, $this->deniedPublishTopics, true);

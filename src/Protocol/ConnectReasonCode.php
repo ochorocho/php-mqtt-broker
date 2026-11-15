@@ -26,4 +26,5 @@ enum ConnectReasonCode: int
     case ClientIdentifierNotValid = 0x85;
     case BadUserNameOrPassword = 0x86;
     case NotAuthorized = 0x87;
+    case ConnectionRateExceeded = 0x9F;
 }

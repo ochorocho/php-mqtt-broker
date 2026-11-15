@@ -26,14 +26,15 @@ installed with Composer, read them as `vendor/bin/`.
 ### Standalone (CLI)
 
 ```bash
-php bin/mqtt-broker
+php bin/mqtt-broker --password-file=/etc/mqtt/passwd
 ```
 
-The broker listens on `0.0.0.0:1883` by default and accepts anyone. Options:
+The broker listens on `0.0.0.0:1883` by default. It refuses to start without an
+authentication option: pass `--password-file` or `--auth`, or `--allow-anonymous`
+to accept every client without credentials on a development machine. Options:
 
 ```bash
-php bin/mqtt-broker --host=127.0.0.1 --port=1884
-php bin/mqtt-broker --password-file=/etc/mqtt/passwd   # require credentials
+php bin/mqtt-broker --allow-anonymous --host=127.0.0.1 --port=1884   # local development
 php bin/mqtt-broker --state-file=/var/lib/mqtt/retained.ndjson  # keep retained messages across restarts
 php bin/mqtt-broker --help                             # every option
 ```
@@ -72,8 +73,10 @@ to shut it down cleanly, or to implement an authenticator, see
 
 ### Authentication
 
-Without an authentication option the broker accepts every client, which is fine
-on a trusted network and wrong anywhere else. There are two ways to change that.
+The CLI needs one of three options. `--allow-anonymous` accepts every client
+without credentials: anyone who can reach the port can then read every topic and
+take over any client ID, so it is for development and test rigs only. The other
+two require credentials.
 
 #### Password file
 
@@ -93,9 +96,18 @@ Three things worth knowing before you deploy it:
 
 - **Client IDs are bound to the account.** `alice` may connect as `alice` or
   `alice-<anything>`, and nothing else. Without this, any valid account could
-  evict another client and inherit its session. Clients whose ID is unrelated to
-  their username — ESPHome sets `client_id` independently — either need their
-  `client_id` set to match, or the broker started with `--allow-any-client-id`.
+  evict another client and inherit its session. The most specific account wins:
+  if `alice-bob` is an account too, it owns `alice-bob` and `alice-bob-*`, and
+  `alice` cannot claim them. An empty client ID gets a broker-assigned one, which
+  belongs to no account. Clients whose ID is unrelated to their username — ESPHome
+  sets `client_id` independently — either need their `client_id` set to match, or
+  the broker started with `--allow-any-client-id`.
+- **Each login costs one bcrypt hash** on the broker's only thread — about 0.2 s at
+  PHP's default cost. A password that has verified once is remembered (as a keyed
+  hash, in memory) so a reconnecting device does not pay again, and a host that
+  fails 10 logins within a minute is refused without hashing until its failures
+  age out. For long random device secrets, `mqtt-passwd --cost=8` keeps the first
+  login cheap too.
 - **There are no per-topic rules.** Every authenticated client may publish and
   subscribe anywhere. If you need ACLs, use a custom authenticator below.
 - **The file is read once at startup.** Adding or removing a user takes effect on
@@ -146,10 +158,9 @@ credentials in extension configuration, not in source.
 
 The same interface is available when embedding the broker as a library, by passing
 `authenticator:` to `Broker`. Before you write one, read
-[the authenticator contract](docs/embedding.md#the-authenticator-contract): only
-`authenticate()` and `canUseClientId()` receive the username, so per-user topic rules
-need the client ID recorded against its account during `authenticate()`. That page has
-a worked example.
+[the authenticator contract](docs/embedding.md#the-authenticator-contract). Every
+method receives the username the connection authenticated with, so per-user topic
+rules need no bookkeeping of their own; that page has a worked example.
 
 ### TLS
 
@@ -311,12 +322,15 @@ matters more here than for a mature broker.
 
 It is marked experimental at the top of this README, and these gaps are real:
 
-- **No rate limiting, and no per-IP accounting.** `ConnectionManager` does not
-  record remote addresses, so password guessing is unthrottled.
-- **Nothing slows a guessing run down.** A rejected login *is* logged — at
-  `warning`, with the username, the remote address and the client ID — but the
-  broker itself neither delays nor blocks the next attempt. Acting on those lines
-  is left to you. A fail2ban filter can match them:
+- **Connections are not limited per address.** `ConnectionManager` does not
+  record remote addresses, so one host can use every `maxConnections` slot.
+- **Login throttling is in-process only.** A host that fails
+  `maxAuthFailuresPerHost` (10) logins within `authFailureWindow` (60 s) is refused
+  without a password check until those failures age out — that protects the event
+  loop, not the account: it forgets on restart, and many addresses each get their
+  own budget. Rejected logins are logged at `warning`, with the username, the
+  remote address and the client ID, and refused-while-throttled attempts on a line
+  of their own ("Login throttled …"). A fail2ban filter can match the failures:
 
   ```
   failregex = ^\[.*\] warning: Authentication failed for .* from <HOST>:\d+
@@ -389,9 +403,9 @@ publishing client's connection, and listeners run synchronously inside the event
 
 ## Testing with MQTT Clients
 
-Once the broker is running, connect with any MQTT client. These commands assume the
-default listener — `bin/mqtt-broker` with no flags, plaintext on 1883, accepting
-anyone:
+Once the broker is running, connect with any MQTT client. These commands assume a
+development listener — `bin/mqtt-broker --allow-anonymous`, plaintext on 1883,
+accepting anyone:
 
 ```bash
 # Subscribe (using mosquitto_sub)
@@ -438,7 +452,7 @@ The project includes a [DDEV](https://ddev.com/) configuration for local develop
 ```bash
 # Start the environment, then the broker
 ddev start
-ddev exec "cd /var/www/html && nohup php bin/mqtt-broker > /tmp/broker.log 2>&1 &"
+ddev exec "cd /var/www/html && nohup php bin/mqtt-broker --allow-anonymous > /tmp/broker.log 2>&1 &"
 
 # Connect from the host (11883 on the host, 1883 inside the container)
 mosquitto_sub -h localhost -p 11883 -t '#'

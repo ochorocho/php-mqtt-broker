@@ -96,8 +96,7 @@ will topics to tolerate it.
 
 ## The authenticator contract
 
-`AuthenticatorInterface` has four methods, and the difference between them is not
-obvious from the signatures:
+`AuthenticatorInterface` has four methods:
 
 ```php
 interface AuthenticatorInterface
@@ -106,26 +105,27 @@ interface AuthenticatorInterface
 
     public function canUseClientId(string $clientId, ?string $username): bool;
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool;
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool;
 
-    public function canPublish(string $clientId, string $topicName): bool;
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool;
 }
 ```
 
-**Only the first two receive the username.** `canSubscribe()` and `canPublish()` get a
-client ID and a topic, nothing else. So per-user topic rules are impossible unless you
-record who a client ID belongs to while you still know — during `authenticate()`.
-
-Getting this wrong is quiet rather than loud: you write an authorizer that compiles,
-passes a smoke test with one client, and silently authorizes the wrong things once two
-accounts are connected.
+**Every method receives the username** the connection authenticated with (null for an
+anonymous one). Decide per account from that argument. Do not keep a map of "which
+account is this client ID" filled in during `authenticate()`: that runs *before* the
+broker checks `canUseClientId()`, so an account with valid credentials could
+overwrite another device's entry with an attempt that is then refused. Earlier
+versions passed no username to `canSubscribe()`/`canPublish()` and this page
+recommended exactly that map; implementations written against it need the extra
+parameter, and can drop the map.
 
 ### When each method is called
 
 | Method | Called |
 |---|---|
-| `authenticate()` | Once per connection, on CONNECT |
-| `canUseClientId()` | Once per connection, immediately after `authenticate()` succeeds |
+| `authenticate()` | Once per connection, on CONNECT — unless the remote host is over its failed-login budget (`maxAuthFailuresPerHost`), in which case it is refused without being asked |
+| `canUseClientId()` | Once per connection, immediately after `authenticate()` succeeds. Not for an ID the broker assigned itself (the client sent an empty one): those are random and belong to no account |
 | `canSubscribe()` | Per topic filter in every SUBSCRIBE — **and again for every restored subscription when a client reconnects to a persistent session** |
 | `canPublish()` | Per inbound PUBLISH, plus once on the will topic at connect, plus again when a will is actually published |
 
@@ -139,6 +139,12 @@ client is told immediately rather than discovering at disconnect that its will w
 dropped, and once at publication, because authorization may have been revoked while
 the client was connected.
 
+`authenticate()` runs on the broker's only thread. A password hash is slow on purpose
+(bcrypt at PHP's default cost is about 0.2 s), and every client waits while it runs.
+The broker throttles hosts that keep failing, but a check that succeeds is paid in
+full each time: remember a verified password — as a keyed hash, never the password —
+the way `PasswordFileAuthenticator` does.
+
 ### Failures deny rather than crash
 
 Every check runs inside a wrapper that catches `\Throwable`, logs it at `error`, and
@@ -151,17 +157,13 @@ it yourself; the broker logs the exception but answers the client the same way.
 
 ### A per-user ACL authenticator
 
-This is the shape to copy. Note `$identities` — without it, `canPublish()` has no idea
-which account `$clientId` belongs to:
+This is the shape to copy:
 
 ```php
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
 
 final class TopicScopedAuthenticator implements AuthenticatorInterface
 {
-    /** @var array<string, string> clientId => username, recorded at authenticate() */
-    private array $identities = [];
-
     public function __construct(private readonly \PDO $pdo)
     {
     }
@@ -176,14 +178,7 @@ final class TopicScopedAuthenticator implements AuthenticatorInterface
         $statement->execute([$username]);
         $hash = $statement->fetchColumn();
 
-        if (!is_string($hash) || !password_verify($password, $hash)) {
-            return false;
-        }
-
-        // The only place the username is available. Everything below depends on it.
-        $this->identities[$clientId] = $username;
-
-        return true;
+        return is_string($hash) && password_verify($password, $hash);
     }
 
     public function canUseClientId(string $clientId, ?string $username): bool
@@ -194,33 +189,37 @@ final class TopicScopedAuthenticator implements AuthenticatorInterface
             && ($clientId === $username || str_starts_with($clientId, $username . '-'));
     }
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool
     {
-        return $this->ownsPrefix($clientId, $topicFilter);
+        return $this->ownsPrefix($username, $topicFilter);
     }
 
-    public function canPublish(string $clientId, string $topicName): bool
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool
     {
-        return $this->ownsPrefix($clientId, $topicName);
+        return $this->ownsPrefix($username, $topicName);
     }
 
-    private function ownsPrefix(string $clientId, string $topic): bool
+    private function ownsPrefix(?string $username, string $topic): bool
     {
-        $username = $this->identities[$clientId] ?? null;
+        // Fail closed for anonymous clients, and for usernames that are topic syntax:
+        // a user called "+" would otherwise own "+/#", which is everyone's topics.
+        if ($username === null || preg_match('/[\/+#]/', $username) === 1) {
+            return false;
+        }
 
-        // Fail closed: an unknown client ID means we never saw it authenticate.
-        return $username !== null && str_starts_with($topic, $username . '/');
+        return str_starts_with($topic, $username . '/');
     }
 }
 ```
 
-Two things this deliberately does not do. It never prunes `$identities`, which is fine
-for a fixed device roster and a leak for thousands of rotating client IDs — clear the
-entry when a client disconnects if that describes you. And `ownsPrefix()` treats a
-subscription filter as a plain string: `str_starts_with` correctly rejects `#` and
-`+/…`, because neither begins with `alice/`. Do not reach for the broker's internal
-topic matcher here; it answers "does this filter match this topic", which is a
-different question from "may this account use this filter".
+Three things this deliberately does not do. `ownsPrefix()` treats a subscription
+filter as a plain string: `str_starts_with` correctly rejects `#`, `+/…` and
+`$share/…`, because none of them begins with `alice/`. Do not reach for the broker's
+internal topic matcher here; it answers "does this filter match this topic", which is
+a different question from "may this account use this filter". `canUseClientId()` has
+the same prefix collision `PasswordFileAuthenticator` guards against — if `alice` and
+`alice-bob` can both be accounts, refuse a client ID that a longer username owns. And
+it does not cache successful logins, which a busy deployment should.
 
 ### The default authenticator
 
@@ -384,7 +383,7 @@ WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
 ## Configuration reference
 
-`Configuration` is a value object: 26 constructor parameters, all with defaults, all
+`Configuration` is a value object: 28 constructor parameters, all with defaults, all
 readonly. **Only eight are reachable from the CLI** — `host`, `port`, `--state-file`
 and the five `--tls-*` options. The others can only be set by constructing it
 yourself, which is the main reason to embed the broker rather than run the binary.
@@ -411,6 +410,8 @@ $config = new Configuration(
 | `maxConnectPacketSize` | `int` | `65536` | Largest packet accepted *before* CONNECT succeeds. An unauthenticated peer has proven nothing, so it does not get `maxPacketSize`; at the old limit ten thousand of them could hold ten gigabytes. Raise it if clients send wills larger than this. |
 | `maxOutboundBufferBytes` | `int` | `8388608` | Backlog tolerated for a client that has stopped reading. Past it the client is disconnected and a `warning` is logged. Without it, a subscriber that never reads makes the broker keep every message routed to it. |
 | `maxClientIdLength` | `int` | `256` | Client identifier length in bytes. |
+| `maxAuthFailuresPerHost` | `int` | `10` | Failed logins tolerated from one remote address within `authFailureWindow`. Beyond it, CONNECT is refused (`0x05`, or `0x9F` Connection rate exceeded in 5.0) without asking the authenticator, and logged as "Login throttled". Successful logins never count. `0` disables. |
+| `authFailureWindow` | `float` | `60.0` | Seconds a failed login counts against its host. |
 
 ### Sessions and keep-alive
 

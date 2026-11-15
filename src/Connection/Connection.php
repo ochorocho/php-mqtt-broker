@@ -19,6 +19,7 @@ final class Connection
 
     private readonly PacketStream $packetStream;
     private ?string $clientId = null;
+    private ?string $username = null;
     private ProtocolVersion $protocolVersion = ProtocolVersion::V311;
     private bool $connected = false;
     private ?TimerInterface $keepAliveTimer = null;
@@ -135,6 +136,17 @@ final class Connection
     public function setClientId(string $clientId): void
     {
         $this->clientId = $clientId;
+    }
+
+    /** The username this connection authenticated with; null for an anonymous one. */
+    public function getUsername(): ?string
+    {
+        return $this->username;
+    }
+
+    public function setUsername(?string $username): void
+    {
+        $this->username = $username;
     }
 
     public function getProtocolVersion(): ProtocolVersion

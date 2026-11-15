@@ -16,6 +16,11 @@ final class RecordingStream implements ConnectionStream
 
     public bool $closed = false;
 
+    public function __construct(
+        private readonly string $remoteAddress = '127.0.0.1:1883',
+    ) {
+    }
+
     public function write(string $data): bool
     {
         $this->writes[] = $data;
@@ -38,6 +43,6 @@ final class RecordingStream implements ConnectionStream
 
     public function getRemoteAddress(): string
     {
-        return '127.0.0.1:1883';
+        return $this->remoteAddress;
     }
 }

@@ -61,9 +61,9 @@ abstract class PacketHandlerTestCase extends TestCase
         );
     }
 
-    protected function connection(): Connection
+    protected function connection(string $remoteAddress = '127.0.0.1:1883'): Connection
     {
-        return new Connection(new RecordingStream(), new PacketEncoder(), Loop::get());
+        return new Connection(new RecordingStream($remoteAddress), new PacketEncoder(), Loop::get());
     }
 
     /**
@@ -75,8 +75,9 @@ abstract class PacketHandlerTestCase extends TestCase
         ProtocolVersion $version = ProtocolVersion::V311,
         ?string $username = null,
         ?ConnectPacket $packet = null,
+        string $remoteAddress = '127.0.0.1:1883',
     ): Connection {
-        $connection = $this->connection();
+        $connection = $this->connection($remoteAddress);
 
         $this->handler->handle($connection, $packet ?? new ConnectPacket(
             protocolName: 'MQTT',
@@ -89,7 +90,7 @@ abstract class PacketHandlerTestCase extends TestCase
         ));
 
         if ($connection->isConnected()) {
-            $this->connections->register($clientId, $connection);
+            $this->connections->register($connection->getClientId() ?? $clientId, $connection);
         }
 
         return $connection;

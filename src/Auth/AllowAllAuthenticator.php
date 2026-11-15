@@ -22,12 +22,12 @@ final class AllowAllAuthenticator implements AuthenticatorInterface
         return true;
     }
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool
     {
         return !in_array($topicFilter, $this->noSubscribeTopics, true);
     }
 
-    public function canPublish(string $clientId, string $topicName): bool
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool
     {
         return true;
     }
