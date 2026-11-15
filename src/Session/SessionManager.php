@@ -9,8 +9,14 @@ final class SessionManager
     /** @var array<string, Session> */
     private array $sessions = [];
 
+    /**
+     * @param (\Closure(string): void)|null $onRemoved Told the client ID of every session
+     *        that expires or is evicted, so state kept elsewhere - subscriptions above
+     *        all - goes with it. Not called for destroy(), whose callers clean up.
+     */
     public function __construct(
         private readonly int $maxSessions = 10000,
+        private readonly ?\Closure $onRemoved = null,
     ) {
     }
 
@@ -34,7 +40,7 @@ final class SessionManager
             }
 
             if ($now - $session->disconnectedAt >= $session->sessionExpiryInterval) {
-                unset($this->sessions[$clientId]);
+                $this->remove((string) $clientId);
                 $reaped++;
             }
         }
@@ -64,7 +70,7 @@ final class SessionManager
         }
 
         if ($oldestId !== null) {
-            unset($this->sessions[$oldestId]);
+            $this->remove((string) $oldestId);
         }
     }
 
@@ -76,14 +82,14 @@ final class SessionManager
         if ($session !== null && $session->disconnectedAt > 0.0 && $session->sessionExpiryInterval > 0) {
             $elapsed = microtime(true) - $session->disconnectedAt;
             if ($elapsed >= $session->sessionExpiryInterval) {
-                unset($this->sessions[$clientId]);
+                $this->remove($clientId);
                 return null;
             }
         }
 
         // SessionExpiryInterval=0 means session expires immediately on disconnect
         if ($session !== null && $session->disconnectedAt > 0.0 && $session->sessionExpiryInterval === 0) {
-            unset($this->sessions[$clientId]);
+            $this->remove($clientId);
             return null;
         }
 
@@ -109,5 +115,17 @@ final class SessionManager
     public function destroy(string $clientId): void
     {
         unset($this->sessions[$clientId]);
+    }
+
+    /**
+     * A session ending on its own, by expiry or eviction.
+     */
+    private function remove(string $clientId): void
+    {
+        unset($this->sessions[$clientId]);
+
+        if ($this->onRemoved !== null) {
+            ($this->onRemoved)($clientId);
+        }
     }
 }

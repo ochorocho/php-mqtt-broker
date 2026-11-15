@@ -35,10 +35,10 @@ authorizer signatures, `--allow-anonymous` required.
 **Success Criteria**: Expired filters stop matching; reconnect after expiry gets nothing;
 live sessions survive the reaper.
 **Tests**: PacketHandlerLifecycleTest additions, SessionManagerTest
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 5: TLS handshake deadline (H5)
 **Goal**: A socket that never completes the TLS handshake is closed.
 **Success Criteria**: Idle pre-handshake socket closed after the timeout; pending cap.
 **Tests**: ReactPhpServer test with a real loopback TLS listener
-**Status**: Not Started
+**Status**: In Progress

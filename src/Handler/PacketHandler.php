@@ -78,8 +78,17 @@ final class PacketHandler
             maxMessages: $this->config->maxRetainedMessages,
             maxBytes: $this->config->maxRetainedBytes,
         );
-        $this->sessionManager = new SessionManager(maxSessions: $this->config->maxSessions);
         $this->inFlight = new InFlightMessageTracker();
+        $this->sessionManager = new SessionManager(
+            maxSessions: $this->config->maxSessions,
+            // Subscriptions stay routed while a client is offline, so its messages can
+            // be queued. When the session itself ends they must go too, or they are
+            // kept forever and handed to the next connection with that client ID.
+            onRemoved: function (string $clientId): void {
+                $this->subscriptionManager->removeClient($clientId);
+                $this->inFlight->forget($clientId);
+            },
+        );
         $this->authThrottle = new AuthFailureThrottle(
             maxFailures: $this->config->maxAuthFailuresPerHost,
             window: $this->config->authFailureWindow,
@@ -494,6 +503,11 @@ final class PacketHandler
                 ));
                 $this->subscriptionManager->removeClient($clientId);
                 $this->subscriptionManager->restoreClientSubscriptions($clientId, $session->subscriptions);
+            } else {
+                // No session to resume, so nothing may be resumed: anything still routed
+                // under this client ID was granted to a session that no longer exists.
+                $this->subscriptionManager->removeClient($clientId);
+                $this->inFlight->forget($clientId);
             }
         }
 
@@ -571,6 +585,10 @@ final class PacketHandler
                 $session->pendingMessages = [];
             }
         }
+
+        // Connected again: the session is no longer counting towards its expiry. Left in
+        // place, the old disconnect time let the reaper drop a live client's session.
+        $preSession->disconnectedAt = 0.0;
 
         $this->logger->info('Client connected: {clientId}', ['clientId' => LogSanitizer::forLog($clientId)]);
     }
