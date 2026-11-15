@@ -44,6 +44,21 @@ $broker = new Broker(
 $broker->start(); // binds, then runs $loop — your timer runs too
 ```
 
+`ReactPhpServer` takes three more arguments, which matter for a TLS listener:
+
+```php
+new ReactPhpServer(
+    $loop,
+    handshakeTimeout: 10.0,       // seconds a TLS client has to finish its handshake
+    maxPendingHandshakes: 1000,   // TLS sockets allowed mid-handshake at once
+    logger: $logger,              // handshake failures and timeouts, at debug
+);
+```
+
+`Broker` only sees a TLS connection once its handshake is done, so its own CONNECT
+deadline and `maxConnections` do not cover a socket that connects and sends nothing;
+these two do. `bin/mqtt-broker` sets `handshakeTimeout` to `connectTimeout`.
+
 Two things to know:
 
 - **You must still call `start()`.** It is what binds the listener and installs the

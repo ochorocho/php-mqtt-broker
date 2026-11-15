@@ -178,7 +178,9 @@ $broker->start();
 
 TLS 1.2 is the minimum by default (TLS 1.3 is used when available). `start()`
 throws if the certificate or key cannot be read, rather than binding a listener
-that would fail every handshake.
+that would fail every handshake. A client gets `connectTimeout` (10 s) to finish
+its TLS handshake, and at most 1000 handshakes are pending at once; a socket that
+connects and sends nothing is closed rather than held.
 
 For mutual TLS, require a client certificate and give the CA bundle to verify
 it against:

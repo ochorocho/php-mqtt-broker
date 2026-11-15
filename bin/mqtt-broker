@@ -25,6 +25,7 @@ use PhpMqtt\Broker\Auth\PasswordFileAuthenticator;
 use PhpMqtt\Broker\Broker;
 use PhpMqtt\Broker\Configuration;
 use PhpMqtt\Broker\Log\StreamLogger;
+use PhpMqtt\Broker\Server\ReactPhpServer;
 
 $options = getopt('', [
     'host:',
@@ -164,7 +165,10 @@ assert($authenticator === null || $authenticator instanceof AuthenticatorInterfa
 
 // Passing null keeps Broker's own default, so one place decides that an
 // unconfigured broker accepts anyone.
-$broker = new Broker(config: $config, authenticator: $authenticator, logger: $logger);
+// The TLS handshake gets the same deadline as CONNECT: until both are done, a peer
+// has proven nothing and must not hold a socket open.
+$server = new ReactPhpServer(handshakeTimeout: $config->connectTimeout, logger: $logger);
+$broker = new Broker(config: $config, server: $server, authenticator: $authenticator, logger: $logger);
 
 if (function_exists('pcntl_async_signals')) {
     pcntl_async_signals(true);
