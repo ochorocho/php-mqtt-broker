@@ -228,7 +228,7 @@ final class PacketHandler
                 }
             }
 
-            $this->inFlight->forget($clientId);
+            $this->inFlight->suspend($clientId);
         }
     }
 
@@ -563,6 +563,14 @@ final class PacketHandler
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
                 $session->pendingMessages = self::withoutExpired($session->pendingMessages, $session->disconnectedAt);
+
+                // QoS 2 deliveries the client confirmed with PUBREC before it left: resend
+                // the PUBREL it is owed (MQTT-4.4.0-1). Each holds a window slot until its
+                // PUBCOMP, as it did on the old connection.
+                foreach ($this->inFlight->pubcompPending($clientId) as $pendingId) {
+                    $connection->send(new PubrelPacket(packetId: $pendingId, protocolVersion: $version));
+                    $connection->incrementUnackedOutgoing();
+                }
 
                 // Through the drain path, so the client's Receive Maximum applies to the
                 // replay too; the rest follows as acknowledgements free the window. Every

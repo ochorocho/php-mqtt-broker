@@ -160,6 +160,30 @@ final class InFlightMessageTracker
         return array_values($this->outgoing[$clientId] ?? []);
     }
 
+    /**
+     * The client left with a session to come back to.
+     *
+     * Its unacknowledged deliveries have been moved into the session queue by the caller
+     * and go from here. What stays is the half of each QoS 2 exchange that cannot simply
+     * be redone: a message the client sent, held until its PUBREL, and a delivery the
+     * client confirmed with PUBREC, which is owed a PUBREL. Both used to be dropped, so
+     * exactly-once became at-most-once across any reconnect.
+     */
+    public function suspend(string $clientId): void
+    {
+        unset($this->outgoing[$clientId]);
+    }
+
+    /**
+     * Ids of deliveries the client confirmed with PUBREC and has not yet completed.
+     *
+     * @return list<int>
+     */
+    public function pubcompPending(string $clientId): array
+    {
+        return array_keys($this->awaitingPubcomp[$clientId] ?? []);
+    }
+
     public function forget(string $clientId): void
     {
         unset(
