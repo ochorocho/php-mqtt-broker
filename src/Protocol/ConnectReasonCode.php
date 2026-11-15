@@ -22,9 +22,11 @@ enum ConnectReasonCode: int
     case NotAuthorizedV311 = 0x05;
 
     // MQTT 5.0 (MQTT-3.2.2.2)
+    case ProtocolError = 0x82;
     case UnsupportedProtocolVersion = 0x84;
     case ClientIdentifierNotValid = 0x85;
     case BadUserNameOrPassword = 0x86;
     case NotAuthorized = 0x87;
+    case BadAuthenticationMethod = 0x8C;
     case ConnectionRateExceeded = 0x9F;
 }

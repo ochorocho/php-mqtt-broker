@@ -272,6 +272,25 @@ final class PacketHandler
             return;
         }
 
+        // Values MQTT 5.0 makes a Protocol Error, refused before anything is decided about
+        // the client. Ignoring them left client and broker disagreeing about the session.
+        $refusal = $version === ProtocolVersion::V50 && $packet->properties !== null
+            ? self::connectPropertyRefusal($packet->properties)
+            : null;
+        if ($refusal !== null) {
+            $this->logger->debug('CONNECT from {address} refused: {reason}', [
+                'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                'reason' => $refusal->name,
+            ]);
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $refusal->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
         $clientId = $packet->clientId;
         if ($clientId === '') {
             if ($version === ProtocolVersion::V50) {
@@ -586,6 +605,29 @@ final class PacketHandler
         $this->logger->info('Client connected: {clientId}', ['clientId' => LogSanitizer::forLog($clientId)]);
     }
 
+    /**
+     * Why a 5.0 CONNECT must be refused for its properties, or null when they are fine.
+     */
+    private static function connectPropertyRefusal(PropertyCollection $properties): ?ConnectReasonCode
+    {
+        // The broker implements no enhanced authentication. Letting such a client in
+        // would skip the exchange it asked for, and with it any proof it may rely on
+        // that this is the server it meant to reach.
+        if ($properties->get(PropertyId::AuthenticationMethod) !== null) {
+            return ConnectReasonCode::BadAuthenticationMethod;
+        }
+
+        if ($properties->get(PropertyId::AuthenticationData) !== null) {
+            return ConnectReasonCode::ProtocolError;
+        }
+
+        if ($properties->get(PropertyId::ReceiveMaximum) === 0 || $properties->get(PropertyId::MaximumPacketSize) === 0) {
+            return ConnectReasonCode::ProtocolError;
+        }
+
+        return null;
+    }
+
     private function handlePublish(Connection $connection, PacketInterface $packet): void
     {
         if (!$packet instanceof PublishPacket) {
@@ -850,6 +892,12 @@ final class PacketHandler
                 continue;
             }
 
+            // A client cannot receive its own messages through a group it shares with
+            // others anyway; asking it to is a Protocol Error (MQTT-3.8.3-4).
+            if ($noLocal && TopicFilter::isShared($topic)) {
+                throw new ProtocolViolationException('No Local cannot be set on a shared subscription');
+            }
+
             // Bound trie growth: deep filters and unlimited subscriptions per client are
             // both cheap ways to allocate nodes that used to be kept for the process life.
             if (substr_count($topic, '/') + 1 > $this->config->maxTopicLevels) {
@@ -890,7 +938,10 @@ final class PacketHandler
 
             // Naming one filter repeatedly re-sent every retained message per
             // repetition. Once per filter per packet is what any client can use.
+            // A shared subscription receives no retained messages (4.8.2): sent to whichever
+            // member happened to subscribe, they would be neither shared nor useful.
             if (!isset($retainedSent[$topic])
+                && !TopicFilter::isShared($topic)
                 && !$connection->isClosed()
                 && $this->shouldSendRetained($version, $retainHandling, $existingSubscription)
             ) {
@@ -1061,6 +1112,12 @@ final class PacketHandler
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->properties !== null) {
             $newSEI = $packet->properties->get(PropertyId::SessionExpiryInterval);
             if ($newSEI !== null) {
+                // A session the CONNECT declined cannot be created on the way out.
+                if ((int) $newSEI > 0 && $connection->getSessionExpiryInterval() === 0) {
+                    throw new ProtocolViolationException(
+                        'DISCONNECT cannot set a Session Expiry Interval when CONNECT set none',
+                    );
+                }
                 $connection->setSessionExpiryInterval((int) $newSEI);
             }
         }
