@@ -4,21 +4,31 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Message;
 
+use PhpMqtt\Broker\Exception\MalformedPacketException;
+use PhpMqtt\Broker\Log\LogSanitizer;
 use PhpMqtt\Broker\Protocol\Packet\PublishPacket;
+use PhpMqtt\Broker\Protocol\Property\PropertyCodec;
 use PhpMqtt\Broker\Protocol\Property\PropertyCollection;
 use PhpMqtt\Broker\Protocol\Property\PropertyId;
 use PhpMqtt\Broker\Protocol\ProtocolVersion;
+use PhpMqtt\Broker\Protocol\TopicFilter;
 use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 
 /**
  * The retained messages on disk, so they outlive the process.
  *
- * Newline-delimited JSON, one line per topic: the topic, the payload as
- * base64 (a payload is bytes, not text - a camera frame is a JPEG), the QoS,
- * the protocol version and the MQTT 5 properties by their numeric id. Written
- * whole through a temporary file and a rename, so a reader never sees half a
- * file; read line by line, skipping what does not parse, so one damaged line
- * does not cost every other topic.
+ * Newline-delimited JSON, one line per topic: the topic, the payload as base64 (a
+ * payload is bytes, not text - a camera frame is a JPEG), the QoS, the protocol
+ * version, and the MQTT 5 properties as base64 of their wire encoding. Written whole
+ * through a temporary file and a rename, so a reader never sees half a file; read line
+ * by line, skipping what does not parse, so one damaged line does not cost every other
+ * topic.
+ *
+ * Properties used to be written as a JSON map of id => value. Correlation data is
+ * binary, so one such message made json_encode fail and the whole write with it. The
+ * wire encoding carries any value, and reading it back through the protocol decoder
+ * validates it the way a client's PUBLISH would be. Files in the old form still load.
  */
 final class RetainedStateFile
 {
@@ -35,24 +45,23 @@ final class RetainedStateFile
     /**
      * Write every retained message out, replacing the file.
      *
+     * A message that cannot be represented is skipped and logged rather than aborting
+     * the write: it would otherwise stop every other message from being saved.
+     *
      * @return int Messages written.
      * @throws \RuntimeException when the file cannot be written.
      */
-    public function write(RetainedMessageStore $store): int
+    public function write(RetainedMessageStore $store, LoggerInterface $logger = new NullLogger()): int
     {
         $lines = [];
         foreach ($store->all() as $topic => $packet) {
-            $line = json_encode([
-                't' => $topic,
-                'p' => base64_encode($packet->payload),
-                'q' => $packet->qos,
-                'v' => $packet->protocolVersion->value,
-                'pr' => $packet->properties === null || $packet->properties->isEmpty()
-                    ? null
-                    : $packet->properties->getAll(),
-            ], JSON_UNESCAPED_SLASHES);
-            if ($line === false) {
-                throw new \RuntimeException(sprintf('Retained message on %s cannot be encoded: %s', $topic, json_last_error_msg()));
+            $line = self::encode((string) $topic, $packet);
+            if ($line === null) {
+                $logger->warning('Retained message on {topic} cannot be written to {path}, skipped', [
+                    'topic' => LogSanitizer::forLog((string) $topic),
+                    'path' => $this->path,
+                ]);
+                continue;
             }
             $lines[] = $line;
         }
@@ -123,6 +132,27 @@ final class RetainedStateFile
         }
     }
 
+    private static function encode(string $topic, PublishPacket $packet): ?string
+    {
+        try {
+            $properties = $packet->properties === null || $packet->properties->isEmpty()
+                ? null
+                : base64_encode(PropertyCodec::encode($packet->properties));
+        } catch (MalformedPacketException) {
+            return null;
+        }
+
+        $line = json_encode([
+            't' => $topic,
+            'p' => base64_encode($packet->payload),
+            'q' => $packet->qos,
+            'v' => $packet->protocolVersion->value,
+            'pb' => $properties,
+        ], JSON_UNESCAPED_SLASHES);
+
+        return $line === false ? null : $line;
+    }
+
     private static function decode(string $line): ?PublishPacket
     {
         try {
@@ -135,6 +165,13 @@ final class RetainedStateFile
             return null;
         }
 
+        // A name a client could have published: the file is trusted, but a value that
+        // gets in here is served to every matching subscriber.
+        $topic = $data['t'];
+        if (!TopicFilter::isValidName($topic) || str_contains($topic, "\0")) {
+            return null;
+        }
+
         $payload = base64_decode($data['p'], true);
         $version = ProtocolVersion::tryFrom((int) ($data['v'] ?? ProtocolVersion::V311->value));
         $qos = (int) ($data['q'] ?? 0);
@@ -142,24 +179,18 @@ final class RetainedStateFile
             return null;
         }
 
-        $properties = null;
-        if (is_array($data['pr'] ?? null)) {
-            $properties = new PropertyCollection();
-            foreach ($data['pr'] as $id => $value) {
-                $property = PropertyId::tryFrom((int) $id);
-                if ($property === null) {
-                    continue;
-                }
-                // A multi-value property was written as the list set() built;
-                // set() appends one at a time, so hand each back on its own.
-                foreach ($property->isMultiValue() && is_array($value) ? $value : [$value] as $one) {
-                    $properties->set($property, $one);
-                }
-            }
+        try {
+            $properties = match (true) {
+                is_string($data['pb'] ?? null) => self::decodeProperties($data['pb']),
+                is_array($data['pr'] ?? null) => self::decodeLegacyProperties($data['pr']),
+                default => null,
+            };
+        } catch (MalformedPacketException|\ValueError) {
+            return null;
         }
 
         return new PublishPacket(
-            topicName: $data['t'],
+            topicName: $topic,
             payload: $payload,
             qos: $qos,
             retain: true,
@@ -169,5 +200,77 @@ final class RetainedStateFile
             protocolVersion: $version,
             properties: $properties,
         );
+    }
+
+    /**
+     * @throws MalformedPacketException
+     */
+    private static function decodeProperties(string $encoded): PropertyCollection
+    {
+        $bytes = base64_decode($encoded, true);
+        if ($bytes === false) {
+            throw new MalformedPacketException('Properties are not base64');
+        }
+
+        $offset = 0;
+        $properties = PropertyCodec::decode($bytes, $offset);
+        if ($offset !== strlen($bytes)) {
+            throw new MalformedPacketException('Trailing bytes after the properties');
+        }
+
+        return $properties;
+    }
+
+    /**
+     * The first release's form: a map of property id => value. Each value is checked
+     * against its property's type and then put through the wire codec, so one that
+     * would fail when a delivery is encoded - and disconnect that subscriber - fails
+     * here instead.
+     *
+     * @param array<array-key, mixed> $raw
+     * @throws MalformedPacketException
+     */
+    private static function decodeLegacyProperties(array $raw): PropertyCollection
+    {
+        $properties = new PropertyCollection();
+        foreach ($raw as $id => $value) {
+            $property = PropertyId::tryFrom((int) $id);
+            if ($property === null) {
+                continue;
+            }
+
+            // A multi-value property was written as the list set() built.
+            $values = $property->isMultiValue() && is_array($value) && array_is_list($value) && !self::isPair($value)
+                ? $value
+                : [$value];
+            foreach ($values as $one) {
+                if (!self::hasTypeOf($property, $one)) {
+                    throw new MalformedPacketException(sprintf('Property 0x%02X has the wrong type', $property->value));
+                }
+                $properties->set($property, $one);
+            }
+        }
+
+        $offset = 0;
+
+        return PropertyCodec::decode(PropertyCodec::encode($properties), $offset);
+    }
+
+    private static function hasTypeOf(PropertyId $property, mixed $value): bool
+    {
+        return match ($property->dataType()) {
+            'byte', 'two_byte', 'four_byte', 'variable_int' => is_int($value),
+            'utf8', 'binary' => is_string($value),
+            'utf8_pair' => is_array($value) && self::isPair($value),
+            default => false,
+        };
+    }
+
+    /**
+     * @param array<array-key, mixed> $value
+     */
+    private static function isPair(array $value): bool
+    {
+        return count($value) === 2 && is_string($value[0] ?? null) && is_string($value[1] ?? null);
     }
 }

@@ -446,7 +446,7 @@ $config = new Configuration(
 | `maxFiltersPerSubscribe` | `int` | `128` | Topic filters acted on in one SUBSCRIBE; the rest are refused (`0x80`, or `0x97` Quota exceeded in 5.0). A filter named twice in one packet has its retained messages sent once. |
 | `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic or filter. |
 | `maxRetainedMessages` | `int` | `10000` | Distinct retained topics. |
-| `maxRetainedBytes` | `int` | `67108864` | Total retained payload bytes — the real memory bound, since everything is in-process. |
+| `maxRetainedBytes` | `int` | `67108864` | Total retained bytes, counting each message's topic name, payload and properties — the real memory bound, since everything is in-process. Only properties that travel with a message (payload format, content type, response topic, correlation data, user properties, message expiry) are retained; a topic alias or authentication data is dropped. |
 | `retainedStatePath` | `?string` | `null` | File the retained messages are kept in across restarts (`--state-file` on the CLI). Written a few seconds after they change and on `stop()`, read back in `start()`; its directory must be writable or `start()` refuses. Null keeps them in memory only. |
 
 ### TLS

@@ -7,6 +7,9 @@ namespace PhpMqtt\Broker\Tests\Unit\Message;
 use PhpMqtt\Broker\Message\RetainedMessageStore;
 use PhpMqtt\Broker\Protocol\Packet\PublishPacket;
 use PhpMqtt\Broker\Protocol\TopicFilter;
+use PhpMqtt\Broker\Protocol\ProtocolVersion;
+use PhpMqtt\Broker\Protocol\Property\PropertyId;
+use PhpMqtt\Broker\Protocol\Property\PropertyCollection;
 use PHPUnit\Framework\TestCase;
 
 final class RetainedMessageStoreTest extends TestCase
@@ -114,5 +117,70 @@ final class RetainedMessageStoreTest extends TestCase
         sort($topics);
 
         return $topics;
+    }
+
+    public function testTopicNamesCountAgainstTheByteLimit(): void
+    {
+        // Payload-only accounting let 10k retained topics of 64 KiB names each hold
+        // 640 MB while the store reported 10 KB.
+        $store = new RetainedMessageStore(maxBytes: 100);
+        $topic = str_repeat('t', 200);
+
+        self::assertFalse($store->store($topic, new PublishPacket(topicName: $topic, payload: 'x', retain: true)));
+    }
+
+    public function testPropertiesCountAgainstTheByteLimit(): void
+    {
+        $store = new RetainedMessageStore(maxBytes: 1000);
+        $properties = new PropertyCollection();
+        $properties->set(PropertyId::UserProperty, ['k', str_repeat('v', 2000)]);
+
+        self::assertFalse($store->store('t', new PublishPacket(
+            topicName: 't',
+            payload: 'x',
+            retain: true,
+            protocolVersion: ProtocolVersion::V50,
+            properties: $properties,
+        )));
+    }
+
+    public function testReplacingAndRemovingGiveTheBytesBack(): void
+    {
+        // Room for exactly one: topic (1) + payload (9).
+        $store = new RetainedMessageStore(maxBytes: 10);
+        self::assertTrue($store->store('a', new PublishPacket(topicName: 'a', payload: '123456789', retain: true)));
+        self::assertTrue($store->store('a', new PublishPacket(topicName: 'a', payload: '987654321', retain: true)));
+        self::assertFalse($store->store('b', new PublishPacket(topicName: 'b', payload: '123456789', retain: true)));
+
+        $store->remove('a');
+
+        self::assertTrue($store->store('b', new PublishPacket(topicName: 'b', payload: '123456789', retain: true)));
+    }
+
+    public function testOnlyPropertiesThatTravelWithTheMessageAreRetained(): void
+    {
+        $properties = new PropertyCollection();
+        $properties->set(PropertyId::TopicAlias, 3);
+        $properties->set(PropertyId::AuthenticationData, "\xFF\x00");
+        $properties->set(PropertyId::UserProperty, ['k', 'v']);
+        $properties->set(PropertyId::CorrelationData, "\x01\x02");
+
+        $store = new RetainedMessageStore();
+        $store->store('t', new PublishPacket(
+            topicName: 't',
+            payload: 'x',
+            retain: true,
+            protocolVersion: ProtocolVersion::V50,
+            properties: $properties,
+        ));
+
+        // A topic alias belongs to one connection, authentication data to one
+        // exchange; neither means anything to a later subscriber, so neither is kept.
+        $retained = $store->all()['t']->properties;
+        self::assertNotNull($retained);
+        self::assertNull($retained->get(PropertyId::TopicAlias));
+        self::assertNull($retained->get(PropertyId::AuthenticationData));
+        self::assertSame([['k', 'v']], $retained->get(PropertyId::UserProperty));
+        self::assertSame("\x01\x02", $retained->get(PropertyId::CorrelationData));
     }
 }

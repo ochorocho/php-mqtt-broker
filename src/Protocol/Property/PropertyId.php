@@ -78,6 +78,25 @@ enum PropertyId: int
     }
 
     /**
+     * Whether the property belongs to the application message and so travels with it to
+     * subscribers (MQTT-3.3.2-14 and the properties beside it). Everything else describes
+     * one connection or one exchange - a topic alias, authentication data - and means
+     * nothing to anyone else.
+     */
+    public function isForwardedWithMessage(): bool
+    {
+        return match ($this) {
+            self::PayloadFormatIndicator,
+            self::MessageExpiryInterval,
+            self::ContentType,
+            self::ResponseTopic,
+            self::CorrelationData,
+            self::UserProperty => true,
+            default => false,
+        };
+    }
+
+    /**
      * Whether this property can appear multiple times in a single property set.
      */
     public function isMultiValue(): bool

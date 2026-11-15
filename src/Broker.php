@@ -341,7 +341,7 @@ final class Broker
             return;
         }
 
-        $written = (new RetainedStateFile($this->config->retainedStatePath))->write($store);
+        $written = (new RetainedStateFile($this->config->retainedStatePath))->write($store, $this->logger);
         $store->markClean();
 
         $this->logger->debug('Wrote {count} retained message(s) to {path}', [

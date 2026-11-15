@@ -22,7 +22,8 @@ final class Configuration
      *                              MQTT 3.1.1 sessions have no expiry of their own.
      * @param int $maxPendingMessagesPerSession Offline queue depth per session.
      * @param int $maxRetainedMessages Distinct retained topics.
-     * @param int $maxRetainedBytes Total retained payload bytes.
+     * @param int $maxRetainedBytes Total retained bytes: topic names, payloads and
+     *                              properties.
      * @param int $maxSubscriptionsPerClient Active subscriptions per client.
      * @param int $maxTopicLevels Levels ('/'-separated) in a topic or filter.
      * @param int $maxClientIdLength Client identifier length in bytes.

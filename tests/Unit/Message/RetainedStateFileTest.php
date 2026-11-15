@@ -155,4 +155,101 @@ final class RetainedStateFileTest extends TestCase
 
         (new RetainedStateFile($this->directory . '/missing/retained.ndjson'))->write(new RetainedMessageStore());
     }
+
+    public function testBinaryPropertiesSurviveTheFile(): void
+    {
+        // Correlation data is binary. Written as JSON text, one non-UTF-8 byte made
+        // json_encode fail and aborted the whole write, every five seconds, for good.
+        $properties = new PropertyCollection();
+        $properties->set(PropertyId::CorrelationData, "\xFF\x00\xFE");
+        $properties->set(PropertyId::MessageExpiryInterval, 3600);
+
+        $store = new RetainedMessageStore();
+        $store->store('req', new PublishPacket(
+            topicName: 'req',
+            payload: 'x',
+            retain: true,
+            protocolVersion: ProtocolVersion::V50,
+            properties: $properties,
+        ));
+        $store->store('other', new PublishPacket(topicName: 'other', payload: 'y', retain: true));
+
+        $file = new RetainedStateFile($this->directory . '/retained.ndjson');
+        self::assertSame(2, $file->write($store, new RecordingLogger()));
+
+        $read = [];
+        foreach ($file->read(new RecordingLogger()) as $packet) {
+            $read[$packet->topicName] = $packet;
+        }
+
+        self::assertSame("\xFF\x00\xFE", $read['req']->properties?->get(PropertyId::CorrelationData));
+        self::assertSame(3600, $read['req']->properties?->get(PropertyId::MessageExpiryInterval));
+        self::assertArrayHasKey('other', $read);
+    }
+
+    public function testOneMessageThatCannotBeWrittenDoesNotCostTheOthers(): void
+    {
+        $store = new RetainedMessageStore();
+        // Not a valid UTF-8 topic, so JSON cannot carry it. The store itself does not
+        // validate; the wire decoder does, so this only arrives by a path like this one.
+        $store->store("bad\xC3", new PublishPacket(topicName: "bad\xC3", payload: 'x', retain: true));
+        $store->store('good', new PublishPacket(topicName: 'good', payload: 'y', retain: true));
+
+        $logger = new RecordingLogger();
+        $file = new RetainedStateFile($this->directory . '/retained.ndjson');
+
+        self::assertSame(1, $file->write($store, $logger));
+        self::assertCount(1, $logger->messagesAt('warning'));
+        self::assertSame(['good'], array_map(
+            static fn(PublishPacket $p): string => $p->topicName,
+            iterator_to_array($file->read(new RecordingLogger()), false),
+        ));
+    }
+
+    public function testAFileFromTheEarlierFormatStillLoads(): void
+    {
+        $path = $this->directory . '/retained.ndjson';
+        // Properties as the first release wrote them: a JSON map of id => value.
+        file_put_contents($path, json_encode([
+            't' => 'sensor/temp',
+            'p' => base64_encode('21.5'),
+            'q' => 1,
+            'v' => 5,
+            'pr' => [3 => 'text/plain', 38 => [['k', 'v']]],
+        ]) . "\n");
+
+        $packets = iterator_to_array((new RetainedStateFile($path))->read(new RecordingLogger()), false);
+
+        self::assertCount(1, $packets);
+        self::assertSame('text/plain', $packets[0]->properties?->get(PropertyId::ContentType));
+        self::assertSame([['k', 'v']], $packets[0]->properties?->get(PropertyId::UserProperty));
+    }
+
+    public function testLinesThatWouldFailLaterAreSkippedNow(): void
+    {
+        $path = $this->directory . '/retained.ndjson';
+        $line = static fn(array $fields): string => (string) json_encode(
+            $fields + ['p' => base64_encode('x'), 'q' => 0, 'v' => 5],
+        );
+        file_put_contents($path, implode("\n", [
+            // Values of the wrong type used to load, then throw while encoding a
+            // delivery - disconnecting whichever client subscribed.
+            $line(['t' => 'a', 'pr' => [38 => 'not a pair']]),
+            $line(['t' => 'b', 'pr' => [3 => ['not', 'text']]]),
+            $line(['t' => 'c', 'pb' => base64_encode("\x05\xFF")]),
+            // Not topic names a client could have published.
+            $line(['t' => 'd/#']),
+            $line(['t' => '']),
+            $line(['t' => 'ok']),
+        ]) . "\n");
+
+        $logger = new RecordingLogger();
+        $topics = array_map(
+            static fn(PublishPacket $p): string => $p->topicName,
+            iterator_to_array((new RetainedStateFile($path))->read($logger), false),
+        );
+
+        self::assertSame(['ok'], $topics);
+        self::assertCount(5, $logger->messagesAt('warning'));
+    }
 }

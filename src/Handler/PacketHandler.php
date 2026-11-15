@@ -1475,16 +1475,11 @@ final class PacketHandler
      */
     private function forwardProperties(PropertyCollection $source, PropertyCollection $dest): void
     {
-        $forwardIds = [
-            PropertyId::PayloadFormatIndicator,
-            PropertyId::ContentType,
-            PropertyId::ResponseTopic,
-            PropertyId::CorrelationData,
-            PropertyId::UserProperty,
-            PropertyId::MessageExpiryInterval,
-        ];
+        foreach (PropertyId::cases() as $propId) {
+            if (!$propId->isForwardedWithMessage()) {
+                continue;
+            }
 
-        foreach ($forwardIds as $propId) {
             $val = $source->get($propId);
             if ($val !== null) {
                 if ($propId->isMultiValue() && is_array($val)) {

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Message;
 
 use PhpMqtt\Broker\Protocol\Packet\PublishPacket;
+use PhpMqtt\Broker\Protocol\Property\PropertyCodec;
 use PhpMqtt\Broker\Protocol\TopicFilter;
 
 final class RetainedMessageStore
@@ -13,6 +14,9 @@ final class RetainedMessageStore
     private array $messages = [];
 
     private int $totalBytes = 0;
+
+    /** @var array<string, int> topic => bytes it is counted as */
+    private array $sizes = [];
 
     /** Whether anything changed since the store was last written out. */
     private bool $dirty = false;
@@ -27,6 +31,8 @@ final class RetainedMessageStore
     /**
      * Retained messages persist until overwritten, so without bounds any client can
      * pin unlimited attacker-chosen data in memory for the life of the process.
+     *
+     * @param int $maxBytes Topic, payload and property bytes across every message.
      */
     public function __construct(
         private readonly int $maxMessages = 10000,
@@ -40,9 +46,10 @@ final class RetainedMessageStore
      */
     public function store(string $topic, PublishPacket $packet): bool
     {
-        $size = strlen($packet->payload);
+        $packet = self::retainable($packet);
+        $size = self::sizeOf($topic, $packet);
         $existing = $this->messages[$topic] ?? null;
-        $delta = $size - ($existing !== null ? strlen($existing->payload) : 0);
+        $delta = $size - ($this->sizes[$topic] ?? 0);
 
         if ($existing === null && count($this->messages) >= $this->maxMessages) {
             return false;
@@ -57,6 +64,7 @@ final class RetainedMessageStore
         }
 
         $this->messages[$topic] = $packet;
+        $this->sizes[$topic] = $size;
         $this->totalBytes += $delta;
         $this->dirty = true;
 
@@ -65,10 +73,9 @@ final class RetainedMessageStore
 
     public function remove(string $topic): void
     {
-        $existing = $this->messages[$topic] ?? null;
-        if ($existing !== null) {
-            $this->totalBytes -= strlen($existing->payload);
-            unset($this->messages[$topic]);
+        if (isset($this->messages[$topic])) {
+            $this->totalBytes -= $this->sizes[$topic] ?? 0;
+            unset($this->messages[$topic], $this->sizes[$topic]);
             self::indexRemove($this->index, explode('/', $topic), 0);
             $this->dirty = true;
         }
@@ -98,6 +105,45 @@ final class RetainedMessageStore
     public function count(): int
     {
         return count($this->messages);
+    }
+
+    /**
+     * What a retained message costs: its topic, its payload and its properties.
+     *
+     * Counting the payload alone left topic names (up to 64 KiB each) and property
+     * blocks (up to the packet size) free, so the byte limit bounded almost nothing.
+     */
+    private static function sizeOf(string $topic, PublishPacket $packet): int
+    {
+        $properties = $packet->properties === null ? 0 : strlen(PropertyCodec::encode($packet->properties));
+
+        return strlen($topic) + strlen($packet->payload) + $properties;
+    }
+
+    /**
+     * The message as it should be kept: only properties that travel with it.
+     */
+    private static function retainable(PublishPacket $packet): PublishPacket
+    {
+        if ($packet->properties === null) {
+            return $packet;
+        }
+
+        $forwardable = $packet->properties->forwardable();
+        if ($forwardable !== null && count($forwardable->getAll()) === count($packet->properties->getAll())) {
+            return $packet;
+        }
+
+        return new PublishPacket(
+            topicName: $packet->topicName,
+            payload: $packet->payload,
+            qos: $packet->qos,
+            dup: false,
+            retain: $packet->retain,
+            packetId: $packet->packetId,
+            protocolVersion: $packet->protocolVersion,
+            properties: $forwardable,
+        );
     }
 
     /**
