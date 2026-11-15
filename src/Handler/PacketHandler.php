@@ -1346,7 +1346,7 @@ final class PacketHandler
         }
 
         foreach ($perClient as $info) {
-            $this->deliverToClient(
+            $this->deliverIsolated(
                 $info['clientId'],
                 $packet,
                 $info['qos'],
@@ -1386,13 +1386,47 @@ final class PacketHandler
             $effectiveQoS = min($packet->qos, $selectedSub->qos);
             $subIds = $selectedSub->subscriptionIdentifier > 0 ? [$selectedSub->subscriptionIdentifier] : [];
 
-            $this->deliverToClient(
+            $this->deliverIsolated(
                 $selectedSub->clientId,
                 $packet,
                 $effectiveQoS,
                 $subIds,
                 $selectedSub->retainAsPublished,
             );
+        }
+    }
+
+    /**
+     * Deliver to one subscriber without letting its failure become anyone else's.
+     *
+     * Routing runs inside the publisher's packet handling. An exception for one
+     * subscriber - a broken socket, a message it cannot be sent - used to escape there:
+     * routing stopped for every subscriber after it, and the publisher, who did nothing
+     * wrong, was disconnected. The failure is now contained to the subscriber it belongs to.
+     *
+     * @param list<int> $subscriptionIds
+     */
+    private function deliverIsolated(
+        string $clientId,
+        PublishPacket $originalPacket,
+        int $qos,
+        array $subscriptionIds = [],
+        bool $retainAsPublished = false,
+    ): void {
+        try {
+            $this->deliverToClient($clientId, $originalPacket, $qos, $subscriptionIds, $retainAsPublished);
+        } catch (\Throwable $e) {
+            $this->logger->error('Delivery to {clientId} failed, closing its connection: {error}', [
+                'clientId' => LogSanitizer::forLog($clientId),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
+                'exception' => $e,
+            ]);
+
+            try {
+                $this->connectionManager->getByClientId($clientId)?->close();
+            } catch (\Throwable) {
+                // Already failing; the close was the last thing worth trying.
+            }
         }
     }
 
