@@ -424,9 +424,9 @@ WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
 ## Configuration reference
 
-`Configuration` is a value object: 28 constructor parameters, all with defaults, all
-readonly. **Only eight are reachable from the CLI** — `host`, `port`, `--state-file`
-and the five `--tls-*` options. The others can only be set by constructing it
+`Configuration` is a value object: 29 constructor parameters, all with defaults, all
+readonly. **Only nine are reachable from the CLI** — `host`, `port`, `--state-file`
+and the six `--tls-*` options. The others can only be set by constructing it
 yourself, which is the main reason to embed the broker rather than run the binary.
 
 ```php
@@ -482,10 +482,11 @@ $config = new Configuration(
 | `tlsCertPath` | `?string` | `null` | Server certificate. Setting it is what enables TLS. |
 | `tlsKeyPath` | `?string` | `null` | Private key. |
 | `tlsKeyPassphrase` | `?string` | `null` | Passphrase for an encrypted private key. |
-| `tlsRequireClientCert` | `bool` | `false` | Require and verify a client certificate (mutual TLS). Needs `tlsClientCaPath`. |
+| `tlsRequireClientCert` | `bool` | `false` | Require and verify a client certificate (mutual TLS). Needs `tlsClientCaPath`, and a TLS listener: `start()` refuses it without `tlsCertPath`, where it would enforce nothing. |
 | `tlsClientCaPath` | `?string` | `null` | CA bundle used to verify client certificates. |
 | `tlsCiphers` | `?string` | `null` | OpenSSL cipher list. Null uses the PHP default. |
 | `tlsMinVersion` | `int` | `STREAM_CRYPTO_METHOD_TLSv1_2_SERVER` | Minimum protocol, as an OpenSSL crypto-method constant. Defaults to TLS 1.2 or better; PHP's own default would still negotiate TLS 1.0 on some builds. |
+| `tlsIdentityAsUsername` | `bool` | `false` | Use the common name of the verified client certificate as the username, ignoring the one in CONNECT; a connection without one is refused. Needs `tlsRequireClientCert`. Pair it with `CertificateIdentityAuthenticator` for certificate-only authentication (client IDs bound to the name), or with your own authenticator, which then receives the certificate's name. `start()` refuses `CertificateIdentityAuthenticator` without it. |
 
 ### Not configurable
 

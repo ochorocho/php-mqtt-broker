@@ -20,6 +20,9 @@ final class RecordingAuthenticator implements AuthenticatorInterface
     /** @var list<string> "method:username" for every authorization check */
     public array $authorizedAs = [];
 
+    /** @var list<string> the username each authenticate() and canUseClientId() call received */
+    public array $authenticatedAs = [];
+
     /**
      * @param list<string> $deniedPublishTopics
      * @param list<string> $deniedSubscribeFilters
@@ -37,6 +40,7 @@ final class RecordingAuthenticator implements AuthenticatorInterface
     public function authenticate(string $clientId, ?string $username, ?string $password): bool
     {
         $this->calls[] = 'authenticate:' . $clientId;
+        $this->authenticatedAs[] = 'authenticate:' . ($username ?? '<none>');
         $this->maybeThrow('authenticate');
 
         return $this->authenticateResult;
@@ -63,6 +67,7 @@ final class RecordingAuthenticator implements AuthenticatorInterface
     public function canUseClientId(string $clientId, ?string $username): bool
     {
         $this->calls[] = 'canUseClientId:' . $clientId;
+        $this->authenticatedAs[] = 'canUseClientId:' . ($username ?? '<none>');
         $this->maybeThrow('canUseClientId');
 
         return !in_array($clientId, $this->deniedClientIds, true);

@@ -5,11 +5,12 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Tests\Unit\Handler;
 
 use PhpMqtt\Broker\Server\ConnectionStream;
+use PhpMqtt\Broker\Server\PeerCertificateStream;
 
 /**
  * A ConnectionStream that keeps what was written instead of touching a socket.
  */
-final class RecordingStream implements ConnectionStream
+final class RecordingStream implements ConnectionStream, PeerCertificateStream
 {
     /** @var list<string> */
     public array $writes = [];
@@ -18,7 +19,13 @@ final class RecordingStream implements ConnectionStream
 
     public function __construct(
         private readonly string $remoteAddress = '127.0.0.1:1883',
+        private readonly ?string $peerCommonName = null,
     ) {
+    }
+
+    public function getPeerCertificateCommonName(): ?string
+    {
+        return $this->peerCommonName;
     }
 
     public function write(string $data): bool

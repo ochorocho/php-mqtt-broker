@@ -21,6 +21,7 @@ require $autoload;
 
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
 use PhpMqtt\Broker\Auth\AuthenticatorLoader;
+use PhpMqtt\Broker\Auth\CertificateIdentityAuthenticator;
 use PhpMqtt\Broker\Auth\PasswordFileAuthenticator;
 use PhpMqtt\Broker\Broker;
 use PhpMqtt\Broker\Configuration;
@@ -35,6 +36,7 @@ $options = getopt('', [
     'tls-passphrase:',
     'tls-client-ca:',
     'tls-require-client-cert',
+    'tls-identity-as-username',
     'password-file:',
     'auth:',
     'allow-any-client-id',
@@ -61,6 +63,13 @@ if ($flag('help')) {
                                for database, LDAP or per-topic rules. The file runs
                                with the broker's privileges: it must be owned by the
                                operator and not writable by the broker user.
+      --tls-identity-as-username
+                               Identify clients by their TLS certificate: its common
+                               name is the username, whatever CONNECT says. Needs
+                               --tls-require-client-cert. On its own it is the whole
+                               authentication, with client IDs bound to the name as
+                               for a password file; with --password-file or --auth,
+                               those check the certificate's name instead.
       --allow-anonymous        Accept every client without credentials. Anyone who
                                can reach the port may then read every topic and take
                                over any client ID. For development and test rigs.
@@ -102,14 +111,17 @@ if ($passwordFile !== null && $authFile !== null) {
 
 // An unconfigured broker used to accept anyone, on every interface by default. That
 // has to be a decision, not an omission.
-if ($passwordFile === null && $authFile === null && !$flag('allow-anonymous')) {
-    fwrite(STDERR, "No authentication configured. Pass --password-file or --auth, or --allow-anonymous\n"
-        . "to accept every client without credentials (development only). See --help.\n");
+$certificateIdentity = $flag('tls-identity-as-username');
+
+if ($passwordFile === null && $authFile === null && !$certificateIdentity && !$flag('allow-anonymous')) {
+    fwrite(STDERR, "No authentication configured. Pass --password-file, --auth or --tls-identity-as-username,\n"
+        . "or --allow-anonymous to accept every client without credentials (development only).\n"
+        . "See --help.\n");
     exit(1);
 }
 
-if ($flag('allow-anonymous') && ($passwordFile !== null || $authFile !== null)) {
-    fwrite(STDERR, "--allow-anonymous cannot be combined with --password-file or --auth\n");
+if ($flag('allow-anonymous') && ($passwordFile !== null || $authFile !== null || $certificateIdentity)) {
+    fwrite(STDERR, "--allow-anonymous cannot be combined with --password-file, --auth or --tls-identity-as-username\n");
     exit(1);
 }
 
@@ -134,6 +146,7 @@ $config = new Configuration(
     tlsKeyPath: $str('tls-key'),
     tlsKeyPassphrase: $str('tls-passphrase'),
     tlsRequireClientCert: $flag('tls-require-client-cert'),
+    tlsIdentityAsUsername: $certificateIdentity,
     tlsClientCaPath: $str('tls-client-ca'),
     retainedStatePath: $str('state-file'),
 );
@@ -153,6 +166,8 @@ try {
         );
     } elseif ($authFile !== null) {
         $authenticator = AuthenticatorLoader::load($authFile);
+    } elseif ($certificateIdentity) {
+        $authenticator = new CertificateIdentityAuthenticator();
     }
 
     $config->validateTls();
@@ -184,6 +199,7 @@ echo sprintf(
     match (true) {
         $passwordFile !== null => 'password file: ' . $passwordFile,
         $authFile !== null => 'authenticator: ' . $authFile,
+        $certificateIdentity => 'client certificate identities',
         default => 'NO AUTHENTICATION, --allow-anonymous',
     },
 );

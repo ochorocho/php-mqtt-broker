@@ -47,6 +47,22 @@ final class CliTest extends TestCase
         self::assertStringContainsString('--allow-anonymous', $stderr);
     }
 
+    public function testCertificateIdentitiesNeedMutualTls(): void
+    {
+        [$exit, , $stderr] = $this->execute('bin/mqtt-broker', ['--tls-identity-as-username']);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('tlsRequireClientCert', $stderr);
+    }
+
+    public function testCertificateIdentitiesAreNotAnonymous(): void
+    {
+        [$exit, , $stderr] = $this->execute('bin/mqtt-broker', ['--tls-identity-as-username', '--allow-anonymous']);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('--allow-anonymous', $stderr);
+    }
+
     public function testMqttPasswdWritesTheRequestedBcryptCost(): void
     {
         $file = $this->directory . '/passwd';

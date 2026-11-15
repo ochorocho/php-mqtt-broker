@@ -6,9 +6,10 @@ namespace PhpMqtt\Broker\Server;
 
 use React\EventLoop\LoopInterface;
 use React\EventLoop\TimerInterface;
+use React\Socket\Connection as ReactSocketConnection;
 use React\Socket\ConnectionInterface as ReactConnection;
 
-final class ReactPhpConnectionStream implements ConnectionStream
+final class ReactPhpConnectionStream implements ConnectionStream, PeerCertificateStream
 {
     /** Seconds a graceful close may wait for the write buffer to flush. */
     public const float FORCE_CLOSE_AFTER = 5.0;
@@ -69,6 +70,27 @@ final class ReactPhpConnectionStream implements ConnectionStream
     public function onClose(callable $handler): void
     {
         $this->connection->on('close', $handler);
+    }
+
+    /**
+     * Read from the stream's TLS context: with capture_peer_cert set, PHP leaves the
+     * certificate the handshake verified there.
+     */
+    public function getPeerCertificateCommonName(): ?string
+    {
+        if (!$this->connection instanceof ReactSocketConnection || !is_resource($this->connection->stream)) {
+            return null;
+        }
+
+        $certificate = stream_context_get_options($this->connection->stream)['ssl']['peer_certificate'] ?? null;
+        if (!$certificate instanceof \OpenSSLCertificate) {
+            return null;
+        }
+
+        // Several CNs come back as a list; an identity has to be exactly one.
+        $commonName = openssl_x509_parse($certificate)['subject']['CN'] ?? null;
+
+        return is_string($commonName) && $commonName !== '' ? $commonName : null;
     }
 
     public function getRemoteAddress(): string

@@ -37,6 +37,7 @@ use PhpMqtt\Broker\Protocol\ProtocolVersion;
 use PhpMqtt\Broker\Protocol\PubackReasonCode;
 use PhpMqtt\Broker\Protocol\SubackReasonCode;
 use PhpMqtt\Broker\Protocol\TopicFilter;
+use PhpMqtt\Broker\Server\PeerCertificateStream;
 use PhpMqtt\Broker\Session\SessionManager;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
 use PhpMqtt\Broker\Event\MessagePublished;
@@ -313,6 +314,30 @@ final class PacketHandler
             }
         }
 
+        // With mutual TLS the certificate already proves who the client is: its name is the
+        // username, and what CONNECT claims does not count.
+        $username = $packet->username;
+        if ($this->config->tlsIdentityAsUsername) {
+            $stream = $connection->getStream();
+            $username = $stream instanceof PeerCertificateStream ? $stream->getPeerCertificateCommonName() : null;
+
+            if ($username === null) {
+                $this->logger->warning('No certificate identity for client {clientId} from {address}, connection refused', [
+                    'clientId' => LogSanitizer::forLog($clientId),
+                    'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                ]);
+                $connection->send(new ConnackPacket(
+                    sessionPresent: false,
+                    returnCode: $version === ProtocolVersion::V50
+                        ? ConnectReasonCode::NotAuthorized->value
+                        : ConnectReasonCode::NotAuthorizedV311->value,
+                    protocolVersion: $version,
+                ));
+                $connection->close();
+                return;
+            }
+        }
+
         // A host that keeps failing is answered without a password check: each check is
         // a deliberately slow hash on the broker's only thread, so unthrottled guessing
         // would stall every client, not just fail to get in.
@@ -337,7 +362,7 @@ final class PacketHandler
         }
 
         if (!$this->authorize(
-            fn(): bool => $this->authenticator->authenticate($clientId, $packet->username, $packet->password),
+            fn(): bool => $this->authenticator->authenticate($clientId, $username, $packet->password),
             'authenticate',
             $clientId,
         )) {
@@ -348,7 +373,7 @@ final class PacketHandler
             $this->logger->warning(
                 'Authentication failed for {username} from {address} (client {clientId})',
                 [
-                    'username' => LogSanitizer::forLog($packet->username ?? '<none>'),
+                    'username' => LogSanitizer::forLog($username ?? '<none>'),
                     'address' => LogSanitizer::address($connection->getRemoteAddress()),
                     'clientId' => LogSanitizer::forLog($clientId),
                 ],
@@ -370,7 +395,7 @@ final class PacketHandler
         // persistent sessions, inheriting its subscriptions and queued messages.
         // An ID the broker generated is random and belongs to no account.
         if (!$connection->isAssignedClientId() && !$this->authorize(
-            fn(): bool => $this->authenticator->canUseClientId($clientId, $packet->username),
+            fn(): bool => $this->authenticator->canUseClientId($clientId, $username),
             'canUseClientId',
             $clientId,
         )) {
@@ -382,7 +407,7 @@ final class PacketHandler
                 'Client ID {clientId} not allowed for {username} from {address}',
                 [
                     'clientId' => LogSanitizer::forLog($clientId),
-                    'username' => LogSanitizer::forLog($packet->username ?? '<none>'),
+                    'username' => LogSanitizer::forLog($username ?? '<none>'),
                     'address' => LogSanitizer::address($connection->getRemoteAddress()),
                 ],
             );
@@ -402,7 +427,7 @@ final class PacketHandler
         // it at CONNECT and silently dropping it at disconnect time.
         if ($packet->hasWill && $packet->willTopic !== null
             && !$this->authorize(
-                fn(): bool => $this->authenticator->canPublish($clientId, $packet->username, $packet->willTopic ?? ''),
+                fn(): bool => $this->authenticator->canPublish($clientId, $username, $packet->willTopic ?? ''),
                 'canPublish(will)',
                 $clientId,
                 $packet->willTopic,
@@ -444,7 +469,7 @@ final class PacketHandler
         }
 
         $connection->setClientId($clientId);
-        $connection->setUsername($packet->username);
+        $connection->setUsername($username);
         $connection->setConnected(true);
         $connection->setCleanSession($packet->cleanSession);
 
@@ -524,7 +549,7 @@ final class PacketHandler
                 $session->subscriptions = array_values(array_filter(
                     $session->subscriptions,
                     fn($sub): bool => $this->authorize(
-                        fn(): bool => $this->authenticator->canSubscribe($clientId, $packet->username, $sub->topicFilter),
+                        fn(): bool => $this->authenticator->canSubscribe($clientId, $username, $sub->topicFilter),
                         'canSubscribe(restore)',
                         $clientId,
                         $sub->topicFilter,

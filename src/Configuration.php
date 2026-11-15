@@ -53,6 +53,9 @@ final class Configuration
      *                                    within $authFailureWindow before further attempts
      *                                    are refused without being checked. 0 disables.
      * @param float $authFailureWindow Seconds a failed login counts against its host.
+     * @param bool $tlsIdentityAsUsername Use the common name of the verified client
+     *                                    certificate as the username, whatever CONNECT
+     *                                    says. Needs $tlsRequireClientCert.
      */
     public function __construct(
         public readonly string $host = '0.0.0.0',
@@ -83,6 +86,7 @@ final class Configuration
         public readonly int $maxInflightMessages = 64,
         public readonly int $maxAuthFailuresPerHost = 10,
         public readonly float $authFailureWindow = 60.0,
+        public readonly bool $tlsIdentityAsUsername = false,
     ) {
     }
 
@@ -165,6 +169,8 @@ final class Configuration
         }
 
         if ($this->tlsRequireClientCert) {
+            // Kept on the stream after the handshake, where the broker reads its name.
+            $tls['capture_peer_cert'] = true;
             $tls['verify_peer'] = true;
             $tls['verify_peer_name'] = false; // Clients are identified by cert, not hostname.
             $tls['allow_self_signed'] = false;
@@ -206,7 +212,17 @@ final class Configuration
      */
     public function validateTls(): void
     {
+        // Both settings are about client certificates, which only a TLS listener sees.
+        // Without one they were simply not enforced.
+        if ($this->tlsIdentityAsUsername && !$this->tlsRequireClientCert) {
+            throw new \RuntimeException('tlsIdentityAsUsername needs tlsRequireClientCert: an unverified certificate proves nothing');
+        }
+
         if (!$this->isTlsEnabled()) {
+            if ($this->tlsRequireClientCert) {
+                throw new \RuntimeException('tlsRequireClientCert needs tlsCertPath: without a certificate the listener is plaintext');
+            }
+
             return;
         }
 

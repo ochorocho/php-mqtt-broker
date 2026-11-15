@@ -200,10 +200,20 @@ $config = new Configuration(
 The CLI accepts the same options:
 
 ```bash
-php bin/mqtt-broker --tls-cert=/path/to/server.crt --tls-key=/path/to/server.key
+php bin/mqtt-broker --tls-cert=/path/to/server.crt --tls-key=/path/to/server.key --password-file=passwd
 php bin/mqtt-broker --tls-cert=server.crt --tls-key=server.key \
-    --tls-require-client-cert --tls-client-ca=ca.crt
+    --tls-require-client-cert --tls-client-ca=ca.crt --tls-identity-as-username
 ```
+
+A verified client certificate proves who the client is, but on its own it only
+decides who may complete the handshake: any holder of a certificate from that CA
+could still claim any username and any client ID. With
+`--tls-identity-as-username` (`tlsIdentityAsUsername: true`) the certificate's
+common name *is* the username, whatever CONNECT says. On its own it is the whole
+authentication — the CN `device-1` may connect as `device-1` or
+`device-1-<anything>`, as with a password file. Combined with `--password-file` or
+`--auth`, those check the certificate's name instead of a claimed one. A
+certificate without a single common name is refused.
 
 With `--tls-cert` the default port is 8883. Note that MQTT credentials are sent
 in the clear on a plaintext listener, so prefer TLS whenever clients
@@ -353,9 +363,9 @@ It is marked experimental at the top of this README, and these gaps are real:
   debugging it, within seconds of a rollout.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
-- **Most limits are unreachable from the CLI.** Only 8 of `Configuration`'s 22
-  options have flags — `host`, `port`, `--state-file` and the five `--tls-*`
-  ones. The other 14,
+- **Most limits are unreachable from the CLI.** Only 9 of `Configuration`'s 29
+  options have flags — `host`, `port`, `--state-file` and the six `--tls-*`
+  ones. The other 20,
   including every `max*` limit and `connectTimeout`, require constructing
   `Configuration` in your own entrypoint; see the
   [configuration reference](docs/embedding.md#configuration-reference). Until then,

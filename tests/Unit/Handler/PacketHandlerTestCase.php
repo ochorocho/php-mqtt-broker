@@ -61,9 +61,9 @@ abstract class PacketHandlerTestCase extends TestCase
         );
     }
 
-    protected function connection(string $remoteAddress = '127.0.0.1:1883'): Connection
+    protected function connection(string $remoteAddress = '127.0.0.1:1883', ?string $peerCommonName = null): Connection
     {
-        return new Connection(new RecordingStream($remoteAddress), new PacketEncoder(), Loop::get());
+        return new Connection(new RecordingStream($remoteAddress, $peerCommonName), new PacketEncoder(), Loop::get());
     }
 
     /**
@@ -76,8 +76,9 @@ abstract class PacketHandlerTestCase extends TestCase
         ?string $username = null,
         ?ConnectPacket $packet = null,
         string $remoteAddress = '127.0.0.1:1883',
+        ?string $peerCommonName = null,
     ): Connection {
-        $connection = $this->connection($remoteAddress);
+        $connection = $this->connection($remoteAddress, $peerCommonName);
 
         $this->handler->handle($connection, $packet ?? new ConnectPacket(
             protocolName: 'MQTT',

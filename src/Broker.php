@@ -6,6 +6,7 @@ namespace PhpMqtt\Broker;
 
 use PhpMqtt\Broker\Auth\AllowAllAuthenticator;
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
+use PhpMqtt\Broker\Auth\CertificateIdentityAuthenticator;
 use PhpMqtt\Broker\Connection\Connection;
 use PhpMqtt\Broker\Connection\ConnectionManager;
 use PhpMqtt\Broker\Exception\MalformedPacketException;
@@ -34,6 +35,7 @@ final class Broker
     private readonly PacketFactory $packetFactory;
     private readonly PacketEncoder $packetEncoder;
     private readonly PacketHandler $packetHandler;
+    private readonly AuthenticatorInterface $authenticator;
 
     public function __construct(
         private readonly Configuration $config = new Configuration(),
@@ -46,11 +48,12 @@ final class Broker
         $this->subscriptionManager = new SubscriptionManager();
         $this->packetFactory = new PacketFactory();
         $this->packetEncoder = new PacketEncoder();
+        $this->authenticator = $authenticator ?? new AllowAllAuthenticator();
 
         $this->packetHandler = new PacketHandler(
             connectionManager: $this->connectionManager,
             subscriptionManager: $this->subscriptionManager,
-            authenticator: $authenticator ?? new AllowAllAuthenticator(),
+            authenticator: $this->authenticator,
             loop: $this->server->getLoop(),
             packetEncoder: $this->packetEncoder,
             logger: $this->logger,
@@ -65,6 +68,11 @@ final class Broker
         // handshake; a broker that silently serves nobody is worse than one that stops.
         $this->config->validateTls();
         $this->config->validateRetainedState();
+        if ($this->authenticator instanceof CertificateIdentityAuthenticator && !$this->config->tlsIdentityAsUsername) {
+            throw new \RuntimeException(
+                'CertificateIdentityAuthenticator needs tlsIdentityAsUsername: otherwise any client that sends a username is let in',
+            );
+        }
         $this->restoreRetained();
 
         $uri = $this->config->getListenUri();
