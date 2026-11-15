@@ -11,8 +11,10 @@ use PhpMqtt\Broker\Connection\ConnectionManager;
 use PhpMqtt\Broker\Exception\MalformedPacketException;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
 use PhpMqtt\Broker\Handler\PacketHandler;
+use PhpMqtt\Broker\Log\LogSanitizer;
 use PhpMqtt\Broker\Message\RetainedStateFile;
 use PhpMqtt\Broker\Protocol\PacketEncoder;
+use PhpMqtt\Broker\Protocol\Packet\PacketType;
 use PhpMqtt\Broker\Protocol\PacketFactory;
 use PhpMqtt\Broker\Server\ConnectionStream;
 use PhpMqtt\Broker\Server\ReactPhpServer;
@@ -167,7 +169,7 @@ final class Broker
         $this->connectionManager->add($connection);
 
         $this->logger->debug('New TCP connection from {address}', [
-            'address' => $stream->getRemoteAddress(),
+            'address' => LogSanitizer::address($stream->getRemoteAddress()),
         ]);
 
         // Drop the connection if CONNECT never arrives. Otherwise an unauthenticated
@@ -176,7 +178,7 @@ final class Broker
             $this->config->connectTimeout,
             function (Connection $conn): void {
                 $this->logger->debug('CONNECT timeout from {address}', [
-                    'address' => $conn->getRemoteAddress(),
+                    'address' => LogSanitizer::address($conn->getRemoteAddress()),
                 ]);
                 $conn->close();
             },
@@ -193,12 +195,32 @@ final class Broker
 
     private function onData(Connection $connection, string $data): void
     {
-        $connection->updateActivity();
-        $connection->getPacketStream()->append($data);
-
+        // Everything below runs inside the guard, buffering included. This is called
+        // straight from the socket's data event: an exception escaping here reaches
+        // $loop->run() and stops the broker for every connected client.
         try {
-            while ($connection->getPacketStream()->hasCompletePacket()) {
-                $rawPacket = $connection->getPacketStream()->nextPacket();
+            $connection->updateActivity();
+            $stream = $connection->getPacketStream();
+            $stream->append($data);
+
+            // A closed connection is done: one read can carry many packets, and acting
+            // on those behind a refused CONNECT would let a single burst run as many
+            // password checks as it holds.
+            while (!$connection->isClosed()) {
+                // Refuse anything but CONNECT from an unauthenticated peer as soon as
+                // its first byte is in, before buffering the rest or decoding any of it.
+                if (!$connection->isConnected() && $connection->getClientId() === null) {
+                    $type = $stream->peekPacketType();
+                    if ($type !== null && $type !== PacketType::CONNECT->value) {
+                        throw new ProtocolViolationException('First packet must be CONNECT');
+                    }
+                }
+
+                if (!$stream->hasCompletePacket()) {
+                    break;
+                }
+
+                $rawPacket = $stream->nextPacket();
                 $version = $connection->isConnected() ? $connection->getProtocolVersion() : null;
 
                 $packet = $this->packetFactory->decode($rawPacket, $version);
@@ -206,8 +228,8 @@ final class Broker
             }
         } catch (MalformedPacketException|ProtocolViolationException $e) {
             $this->logger->warning('Protocol error from {client}: {error}', [
-                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
-                'error' => $e->getMessage(),
+                'client' => self::clientForLog($connection),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
                 'exception' => $e,
             ]);
             // Only close if not already being disconnected (clientId set + connected=false means graceful disconnect in progress)
@@ -219,8 +241,8 @@ final class Broker
             // would reach $loop->run() and drop every connected client. Contain the
             // failure to the connection that caused it.
             $this->logger->error('Unexpected error handling data from {client}: {error}', [
-                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
-                'error' => $e->getMessage(),
+                'client' => self::clientForLog($connection),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
                 'exception' => $e,
             ]);
             $connection->close();
@@ -235,8 +257,8 @@ final class Broker
             $this->packetHandler->handleDisconnect($connection, false);
         } catch (\Throwable $e) {
             $this->logger->error('Error during disconnect of {client}: {error}', [
-                'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
-                'error' => $e->getMessage(),
+                'client' => self::clientForLog($connection),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
                 'exception' => $e,
             ]);
         }
@@ -244,8 +266,21 @@ final class Broker
         $this->connectionManager->remove($connection);
 
         $this->logger->debug('Connection closed: {client}', [
-            'client' => $connection->getClientId() ?? $connection->getRemoteAddress(),
+            'client' => self::clientForLog($connection),
         ]);
+    }
+
+    /**
+     * The client ID once known, the peer address before that; escaped either way,
+     * because a client ID is whatever the client sent.
+     */
+    private static function clientForLog(Connection $connection): string
+    {
+        $clientId = $connection->getClientId();
+
+        return $clientId !== null
+            ? LogSanitizer::forLog($clientId)
+            : LogSanitizer::address($connection->getRemoteAddress());
     }
 
     /**

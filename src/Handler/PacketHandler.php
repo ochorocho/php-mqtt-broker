@@ -9,6 +9,7 @@ use PhpMqtt\Broker\Configuration;
 use PhpMqtt\Broker\Connection\Connection;
 use PhpMqtt\Broker\Connection\ConnectionManager;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
+use PhpMqtt\Broker\Log\LogSanitizer;
 use PhpMqtt\Broker\Message\RetainedMessageStore;
 use PhpMqtt\Broker\Protocol\Packet\ConnackPacket;
 use PhpMqtt\Broker\Protocol\Packet\ConnectPacket;
@@ -152,8 +153,8 @@ final class PacketHandler
                         $this->publishWillMessage($connection);
                     } catch (\Throwable $e) {
                         $this->logger->error('Delayed will publication failed for {clientId}: {error}', [
-                            'clientId' => $clientId,
-                            'error' => $e->getMessage(),
+                            'clientId' => LogSanitizer::forLog($clientId),
+                            'error' => LogSanitizer::forLog($e->getMessage(), 256),
                             'exception' => $e,
                         ]);
                     }
@@ -276,9 +277,9 @@ final class PacketHandler
             $this->logger->warning(
                 'Authentication failed for {username} from {address} (client {clientId})',
                 [
-                    'username' => self::forLog($packet->username ?? '<none>'),
-                    'address' => self::addressForLog($connection->getRemoteAddress()),
-                    'clientId' => self::forLog($clientId),
+                    'username' => LogSanitizer::forLog($packet->username ?? '<none>'),
+                    'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                    'clientId' => LogSanitizer::forLog($clientId),
                 ],
             );
 
@@ -308,9 +309,9 @@ final class PacketHandler
             $this->logger->warning(
                 'Client ID {clientId} not allowed for {username} from {address}',
                 [
-                    'clientId' => self::forLog($clientId),
-                    'username' => self::forLog($packet->username ?? '<none>'),
-                    'address' => self::addressForLog($connection->getRemoteAddress()),
+                    'clientId' => LogSanitizer::forLog($clientId),
+                    'username' => LogSanitizer::forLog($packet->username ?? '<none>'),
+                    'address' => LogSanitizer::address($connection->getRemoteAddress()),
                 ],
             );
 
@@ -342,8 +343,8 @@ final class PacketHandler
             $this->logger->warning(
                 'Will topic {topic} denied for {clientId} at connect, connection refused',
                 [
-                    'topic' => self::forLog($packet->willTopic ?? ''),
-                    'clientId' => self::forLog($clientId),
+                    'topic' => LogSanitizer::forLog($packet->willTopic ?? ''),
+                    'clientId' => LogSanitizer::forLog($clientId),
                 ],
             );
 
@@ -485,7 +486,9 @@ final class PacketHandler
 
         if ($effectiveKeepAlive > 0) {
             $connection->startKeepAliveTimer(function (Connection $conn): void {
-                $this->logger->debug('Keep alive timeout for {client}', ['client' => $conn->getClientId()]);
+                $this->logger->debug('Keep alive timeout for {client}', [
+                    'client' => LogSanitizer::forLog($conn->getClientId() ?? ''),
+                ]);
                 $this->handleDisconnect($conn, false);
                 $conn->close();
             });
@@ -527,7 +530,7 @@ final class PacketHandler
             }
         }
 
-        $this->logger->info('Client connected: {clientId}', ['clientId' => $clientId]);
+        $this->logger->info('Client connected: {clientId}', ['clientId' => LogSanitizer::forLog($clientId)]);
     }
 
     private function handlePublish(Connection $connection, PacketInterface $packet): void
@@ -623,8 +626,8 @@ final class PacketHandler
                 // broker that does not support them; the operator should know
                 // it is a limit instead.
                 $this->logger->warning('Retained message on {topic} from {clientId} dropped: retained limits reached', [
-                    'topic' => $packet->topicName,
-                    'clientId' => $clientId,
+                    'topic' => LogSanitizer::forLog($packet->topicName),
+                    'clientId' => LogSanitizer::forLog($clientId),
                 ]);
             }
         }
@@ -1012,40 +1015,12 @@ final class PacketHandler
         if (count($session->pendingMessages) >= $limit) {
             array_shift($session->pendingMessages);
             $this->logger->warning('Offline queue full for {clientId}, dropped oldest message', [
-                'clientId' => $session->clientId,
+                'clientId' => LogSanitizer::forLog($session->clientId),
                 'limit' => $limit,
             ]);
         }
 
         $session->pendingMessages[] = $packet;
-    }
-
-    /**
-     * Make an attacker-controlled string safe to interpolate into a log line.
-     *
-     * Usernames and client IDs come off the wire, and the UTF-8 validation they pass
-     * through rejects NUL and surrogates but not newlines — so an unescaped one could
-     * forge whole log entries and poison anything parsing them.
-     */
-    private static function forLog(string $value): string
-    {
-        $escaped = addcslashes($value, "\0..\37\\\177");
-
-        return mb_strlen($escaped) > 128 ? mb_substr($escaped, 0, 128) . '…' : $escaped;
-    }
-
-    /**
-     * The peer address without the transport scheme.
-     *
-     * The stream reports `tcp://host:port` (or `tls://…`), but a log line is read by
-     * fail2ban and friends as well as by people, and a scheme that varies with the
-     * listener only complicates the pattern they have to match.
-     */
-    private static function addressForLog(string $remoteAddress): string
-    {
-        $withoutScheme = preg_replace('#^[a-z0-9.+-]+://#i', '', $remoteAddress) ?? $remoteAddress;
-
-        return self::forLog($withoutScheme);
     }
 
     /**
@@ -1064,9 +1039,9 @@ final class PacketHandler
         } catch (\Throwable $e) {
             $this->logger->error('Authenticator failed during {action} for {clientId}, denying: {error}', [
                 'action' => $action,
-                'clientId' => $clientId,
-                'topic' => $topic,
-                'error' => $e->getMessage(),
+                'clientId' => LogSanitizer::forLog($clientId),
+                'topic' => LogSanitizer::forLog($topic),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
                 'exception' => $e,
             ]);
 
@@ -1086,8 +1061,8 @@ final class PacketHandler
         $isV5 = $version === ProtocolVersion::V50;
 
         $this->logger->warning('Publish denied for {clientId} on {topic}', [
-            'clientId' => $connection->getClientId(),
-            'topic' => $packet->topicName,
+            'clientId' => LogSanitizer::forLog($connection->getClientId() ?? ''),
+            'topic' => LogSanitizer::forLog($packet->topicName),
         ]);
 
         if ($packet->qos === 1 && $packet->packetId !== null) {
@@ -1126,8 +1101,8 @@ final class PacketHandler
             $willTopic,
         )) {
             $this->logger->warning('Will message denied for {clientId} on {topic}', [
-                'clientId' => $clientId,
-                'topic' => $willTopic,
+                'clientId' => LogSanitizer::forLog($clientId),
+                'topic' => LogSanitizer::forLog($willTopic),
             ]);
             return;
         }

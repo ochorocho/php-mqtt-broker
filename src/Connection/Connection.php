@@ -45,6 +45,7 @@ final class Connection
     private bool $assignedClientId = false;
     private ?TimerInterface $connectTimer = null;
     private bool $disconnectHandled = false;
+    private bool $closed = false;
 
     public function __construct(
         private readonly ConnectionStream $stream,
@@ -73,9 +74,19 @@ final class Connection
 
     public function close(): void
     {
+        $this->closed = true;
         $this->cancelKeepAliveTimer();
         $this->cancelConnectTimer();
         $this->stream->close();
+    }
+
+    /**
+     * Whether close() has been called. The socket may still be flushing, but nothing
+     * more that arrives on it is to be acted on.
+     */
+    public function isClosed(): bool
+    {
+        return $this->closed;
     }
 
     public function getClientId(): ?string

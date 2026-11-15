@@ -16,26 +16,46 @@ final class PacketStream
     private string $buffer = '';
 
     /**
-     * @param int $maxPacketSize Cap on both a single packet and the buffer itself.
-     *                           Without it a client can declare a remaining length of
-     *                           up to 268 MB, or simply never complete a packet, and
-     *                           the buffer grows until the process runs out of memory.
+     * @param int $maxPacketSize Cap on a single packet and on the bytes left over after
+     *                           complete packets are taken. Without it a client can
+     *                           declare a remaining length of up to 268 MB, or never
+     *                           complete a packet, and the buffer grows until the
+     *                           process runs out of memory.
      */
     public function __construct(
         private readonly int $maxPacketSize = self::DEFAULT_MAX_PACKET_SIZE,
     ) {
     }
 
+    /**
+     * The cap applies to what is already buffered, not to buffer plus new data: a read
+     * routinely carries the tail of one full-size packet and the start of the next.
+     * Callers drain complete packets after every append, so the buffer stays within
+     * the cap plus one read.
+     */
     public function append(string $data): void
     {
-        if (strlen($this->buffer) + strlen($data) > $this->maxPacketSize) {
+        if (strlen($this->buffer) > $this->maxPacketSize) {
             throw new MalformedPacketException(sprintf(
-                'Receive buffer would exceed maximum packet size of %d bytes',
+                'Receive buffer exceeds maximum packet size of %d bytes',
                 $this->maxPacketSize,
             ));
         }
 
         $this->buffer .= $data;
+    }
+
+    /**
+     * The control packet type of the packet at the head of the buffer, or null when
+     * nothing is buffered. Lets a caller refuse a packet before decoding any of it.
+     */
+    public function peekPacketType(): ?int
+    {
+        if ($this->buffer === '') {
+            return null;
+        }
+
+        return ord($this->buffer[0]) >> 4;
     }
 
     public function hasCompletePacket(): bool

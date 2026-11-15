@@ -322,8 +322,13 @@ It is marked experimental at the top of this README, and these gaps are real:
   failregex = ^\[.*\] warning: Authentication failed for .* from <HOST>:\d+
   ```
 
-  Usernames and client IDs are attacker-controlled, so control characters in them
-  are escaped before they reach the log and cannot forge entries.
+  Usernames, client IDs and topics are attacker-controlled, and MQTT allows
+  newlines in all three. Every such value is escaped before it is logged, and the
+  CLI's logger escapes control characters in each finished line as well, so no
+  client can produce a line of its own — say, a forged "Authentication failed" for
+  an address it wants banned. A client must also send CONNECT first: anything else
+  is refused on its first byte, before it reaches a decoder. If you embed the broker
+  with your own PSR-3 logger, it receives already-escaped values.
 
   A refused *client ID* is logged too, but on a separate line that the filter
   deliberately does not match — and should not. It means the password was correct

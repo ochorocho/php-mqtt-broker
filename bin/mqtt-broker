@@ -24,6 +24,7 @@ use PhpMqtt\Broker\Auth\AuthenticatorLoader;
 use PhpMqtt\Broker\Auth\PasswordFileAuthenticator;
 use PhpMqtt\Broker\Broker;
 use PhpMqtt\Broker\Configuration;
+use PhpMqtt\Broker\Log\StreamLogger;
 
 $options = getopt('', [
     'host:',
@@ -119,19 +120,9 @@ $config = new Configuration(
     retainedStatePath: $str('state-file'),
 );
 
-$logger = new class extends \Psr\Log\AbstractLogger {
-    public function log($level, \Stringable|string $message, array $context = []): void
-    {
-        $msg = str_replace(
-            array_map(fn($k) => '{' . $k . '}', array_keys($context)),
-            array_map(fn($v) => $v instanceof \Throwable ? $v->getMessage() . "\n" . $v->getTraceAsString() : (string) $v, array_values($context)),
-            (string) $message,
-        );
-        // Full date and offset, so lines stay orderable across days and are usable as
-        // input to a log-based blocker rather than only readable by a human.
-        fwrite(STDERR, sprintf("[%s] %s: %s\n", date('Y-m-d H:i:sP'), $level, $msg));
-    }
-};
+// Escapes every value it writes: its lines are what the fail2ban filter matches,
+// so nothing a client sends may produce a line of its own.
+$logger = new StreamLogger(STDERR);
 
 try {
     // Build the authenticator and check the TLS material before announcing a
