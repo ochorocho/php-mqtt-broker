@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Tests\Unit\Connection;
 
 use PhpMqtt\Broker\Connection\Connection;
+use PhpMqtt\Broker\Protocol\Packet\PingrespPacket;
 use PhpMqtt\Broker\Protocol\PacketEncoder;
 use PhpMqtt\Broker\Server\ConnectionStream;
 use PHPUnit\Framework\TestCase;
@@ -15,8 +16,9 @@ final class ConnectionTest extends TestCase
     private function connection(): Connection
     {
         $stream = new class implements ConnectionStream {
-            public function write(string $data): void
+            public function write(string $data): bool
             {
+                return true;
             }
 
             public function close(): void
@@ -76,5 +78,102 @@ final class ConnectionTest extends TestCase
 
         self::assertFalse($connection->isConnected());
         self::assertFalse($connection->isDisconnectHandled());
+    }
+
+    public function testACongestedConnectionIsClosedPastTheOutboundLimit(): void
+    {
+        $stream = new CongestedStream();
+        $overflowed = false;
+        $connection = new Connection(
+            stream: $stream,
+            encoder: new PacketEncoder(),
+            loop: Loop::get(),
+            maxOutboundBufferBytes: 100,
+            onOverflow: static function () use (&$overflowed): void {
+                $overflowed = true;
+            },
+        );
+
+        // A peer that stops reading leaves every write in the broker's buffer. QoS 0
+        // has no flow control of its own, so without a cap that buffer has no end.
+        for ($i = 0; $i < 60; $i++) {
+            $connection->send(new PingrespPacket());
+        }
+
+        self::assertTrue($stream->closed);
+        self::assertTrue($overflowed);
+        self::assertTrue($connection->isClosed());
+        self::assertLessThanOrEqual(51, count($stream->writes), 'Nothing is written once closed');
+    }
+
+    public function testAWriteThatDrainsResetsTheCount(): void
+    {
+        $stream = new CongestedStream();
+        $connection = new Connection(
+            stream: $stream,
+            encoder: new PacketEncoder(),
+            loop: Loop::get(),
+            maxOutboundBufferBytes: 100,
+        );
+
+        for ($i = 0; $i < 200; $i++) {
+            // Every tenth write finds the buffer drained below ReactPHP's soft limit.
+            $stream->result = $i % 10 === 9;
+            $connection->send(new PingrespPacket());
+        }
+
+        self::assertFalse($stream->closed);
+    }
+
+    public function testRaisingThePacketLimitAfterConnect(): void
+    {
+        $connection = new Connection(
+            stream: new CongestedStream(),
+            encoder: new PacketEncoder(),
+            loop: Loop::get(),
+            maxPacketSize: 16,
+        );
+
+        $connection->getPacketStream()->setMaxPacketSize(1024);
+        $connection->getPacketStream()->append("\x30\x64" . str_repeat('x', 100));
+
+        self::assertTrue($connection->getPacketStream()->hasCompletePacket());
+    }
+}
+
+/**
+ * A stream that reports backpressure on every write unless told otherwise.
+ */
+final class CongestedStream implements ConnectionStream
+{
+    public bool $result = false;
+    public bool $closed = false;
+
+    /** @var list<string> */
+    public array $writes = [];
+
+    public function write(string $data): bool
+    {
+        $this->writes[] = $data;
+
+        return $this->result;
+    }
+
+    public function close(): void
+    {
+        $this->closed = true;
+    }
+
+    public function onData(callable $handler): void
+    {
+    }
+
+    public function onClose(callable $handler): void
+    {
+    }
+
+    public function getRemoteAddress(): string
+    {
+        return '127.0.0.1:1';
     }
 }

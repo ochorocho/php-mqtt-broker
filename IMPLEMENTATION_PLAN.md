@@ -20,7 +20,7 @@ pre-CONNECT non-CONNECT packet rejected before decoding; every logged attacker v
 **Success Criteria**: Repeated filters deliver retained once; filter cap; congested
 writers disconnected; forced close after end(); small pre-CONNECT limit; bogus acks ignored.
 **Tests**: PacketHandlerMessagingTest additions, ConnectionTest, BrokerRobustnessTest
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 3: Authentication hardening (H4, M1, M2, M8)
 **Goal**: Cheap repeat logins, throttled failures, no client-ID collisions, username

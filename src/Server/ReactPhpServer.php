@@ -24,7 +24,7 @@ final class ReactPhpServer implements ServerInterface
         $this->socket = new SocketServer($uri, $context, $this->loop);
 
         $this->socket->on('connection', function (ReactConnection $conn) use ($onConnection): void {
-            $onConnection(new ReactPhpConnectionStream($conn));
+            $onConnection(new ReactPhpConnectionStream($conn, $this->loop));
         });
     }
 

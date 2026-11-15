@@ -397,6 +397,13 @@ final class PacketHandler
             }
         }
 
+        // 3.1.1 has no Receive Maximum, and a 5.0 client may ask for 65535: either way
+        // the broker would hold that many unacknowledged messages for one client.
+        $connection->setReceiveMaximum(min($connection->getReceiveMaximum(), $this->config->maxInflightMessages));
+
+        // Authenticated now; the pre-CONNECT packet limit no longer applies.
+        $connection->getPacketStream()->setMaxPacketSize($this->config->maxPacketSize);
+
         $connection->clearTopicAliases();
 
         // Set keepalive: for v5.0, cap at SERVER_KEEP_ALIVE if client's value exceeds it
@@ -664,9 +671,10 @@ final class PacketHandler
             return;
         }
 
-        $this->inFlight->acknowledgeOutgoing($clientId, $packet->packetId);
-        $connection->decrementUnackedOutgoing();
-        $this->drainPendingMessages($connection);
+        if ($this->inFlight->acknowledgeOutgoing($clientId, $packet->packetId)) {
+            $connection->decrementUnackedOutgoing();
+            $this->drainPendingMessages($connection);
+        }
     }
 
     private function handlePubrec(Connection $connection, PacketInterface $packet): void
@@ -732,9 +740,10 @@ final class PacketHandler
             return;
         }
 
-        $this->inFlight->completeOutgoing($clientId, $packet->packetId);
-        $connection->decrementUnackedOutgoing();
-        $this->drainPendingMessages($connection);
+        if ($this->inFlight->completeOutgoing($clientId, $packet->packetId)) {
+            $connection->decrementUnackedOutgoing();
+            $this->drainPendingMessages($connection);
+        }
     }
 
     private function handleSubscribe(Connection $connection, PacketInterface $packet): void
@@ -769,7 +778,19 @@ final class PacketHandler
 
         $returnCodes = [];
 
-        foreach ($packet->subscriptions as $sub) {
+        /** @var array<string, true> $retainedSent filters whose retained messages went out in this packet */
+        $retainedSent = [];
+
+        foreach (array_values($packet->subscriptions) as $index => $sub) {
+            // A single SUBSCRIBE could name hundreds of thousands of filters, each one a
+            // retained-store lookup and a burst of output.
+            if ($index >= $this->config->maxFiltersPerSubscribe) {
+                $returnCodes[] = $version === ProtocolVersion::V50
+                    ? SubackReasonCode::QuotaExceeded->value
+                    : SubackReasonCode::UnspecifiedError->value;
+                continue;
+            }
+
             $topic = $sub['topic'];
             $qos = $sub['qos'];
             $noLocal = $sub['noLocal'] ?? false;
@@ -821,7 +842,13 @@ final class PacketHandler
             );
             $returnCodes[] = $qos; // Granted QoS
 
-            if ($this->shouldSendRetained($version, $retainHandling, $existingSubscription)) {
+            // Naming one filter repeatedly re-sent every retained message per
+            // repetition. Once per filter per packet is what any client can use.
+            if (!isset($retainedSent[$topic])
+                && !$connection->isClosed()
+                && $this->shouldSendRetained($version, $retainHandling, $existingSubscription)
+            ) {
+                $retainedSent[$topic] = true;
                 $this->deliverRetainedMessages(
                     $connection,
                     $clientId,
@@ -873,6 +900,11 @@ final class PacketHandler
         $version = $connection->getProtocolVersion();
 
         foreach ($this->retainedMessages->getMatching($topicFilter) as $retainedPacket) {
+            // Closed mid-delivery, e.g. for not reading: the rest would go nowhere.
+            if ($connection->isClosed()) {
+                return;
+            }
+
             $qos = min($retainedPacket->qos, $subscribedQoS);
 
             $properties = null;

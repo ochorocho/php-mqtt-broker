@@ -103,4 +103,51 @@ final class BrokerRobustnessTest extends BrokerTestCase
         self::assertStringContainsString('First packet must be CONNECT', $warnings[0]);
         self::assertStringNotContainsString('injected', $warnings[0]);
     }
+
+    public function testUnauthenticatedPeersGetASmallerPacketLimit(): void
+    {
+        $this->startBroker(new Configuration(maxConnectPacketSize: 1024));
+
+        // Before CONNECT a peer has proven nothing, yet could buffer a full-size packet.
+        // Ten thousand of them used to be ten gigabytes.
+        $stream = $this->server->connect();
+        $stream->push("\x10" . DataType::encodeVariableByteInteger(2000) . str_repeat("\x00", 100));
+
+        self::assertTrue($stream->closed);
+    }
+
+    public function testTheFullPacketLimitAppliesOnceConnected(): void
+    {
+        $this->startBroker(new Configuration(maxPacketSize: 8192, maxConnectPacketSize: 1024));
+
+        $subscriber = $this->connectClient('sub');
+        $subscriber->push(self::encode(new SubscribePacket(packetId: 1, subscriptions: [['topic' => 't', 'qos' => 0]])));
+
+        $publisher = $this->connectClient('pub', remoteAddress: 'tcp://127.0.0.1:50001');
+        $publisher->push(self::encode(new PublishPacket(topicName: 't', payload: str_repeat('p', 4000))));
+
+        self::assertFalse($publisher->closed);
+        self::assertCount(1, self::receivedOfType($subscriber, PublishPacket::class));
+    }
+
+    public function testASubscriberThatStopsReadingIsDisconnected(): void
+    {
+        $this->startBroker(new Configuration(maxOutboundBufferBytes: 10_000));
+
+        $subscriber = $this->connectClient('slow');
+        $subscriber->push(self::encode(new SubscribePacket(packetId: 1, subscriptions: [['topic' => 't', 'qos' => 0]])));
+        $subscriber->writeResult = false;
+
+        $publisher = $this->connectClient('pub', remoteAddress: 'tcp://127.0.0.1:50001');
+        for ($i = 0; $i < 50; $i++) {
+            $publisher->push(self::encode(new PublishPacket(topicName: 't', payload: str_repeat('p', 500))));
+        }
+
+        self::assertTrue($subscriber->closed);
+        self::assertFalse($publisher->closed);
+        self::assertNotSame([], array_filter(
+            $this->logger->messagesAt('warning'),
+            static fn(string $line): bool => str_contains($line, 'outbound buffer'),
+        ));
+    }
 }

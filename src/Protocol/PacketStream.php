@@ -16,6 +16,13 @@ final class PacketStream
     private string $buffer = '';
 
     /**
+     * Where the next packet starts. Packets are read by advancing this rather than
+     * cutting each one off the front, which copied the rest of the buffer once per
+     * packet: quadratic in a read full of tiny packets.
+     */
+    private int $offset = 0;
+
+    /**
      * @param int $maxPacketSize Cap on a single packet and on the bytes left over after
      *                           complete packets are taken. Without it a client can
      *                           declare a remaining length of up to 268 MB, or never
@@ -23,8 +30,16 @@ final class PacketStream
      *                           process runs out of memory.
      */
     public function __construct(
-        private readonly int $maxPacketSize = self::DEFAULT_MAX_PACKET_SIZE,
+        private int $maxPacketSize = self::DEFAULT_MAX_PACKET_SIZE,
     ) {
+    }
+
+    /**
+     * Change the cap, e.g. once a peer has authenticated and may send full-size packets.
+     */
+    public function setMaxPacketSize(int $maxPacketSize): void
+    {
+        $this->maxPacketSize = $maxPacketSize;
     }
 
     /**
@@ -35,6 +50,11 @@ final class PacketStream
      */
     public function append(string $data): void
     {
+        if ($this->offset > 0) {
+            $this->buffer = (string) substr($this->buffer, $this->offset);
+            $this->offset = 0;
+        }
+
         if (strlen($this->buffer) > $this->maxPacketSize) {
             throw new MalformedPacketException(sprintf(
                 'Receive buffer exceeds maximum packet size of %d bytes',
@@ -51,11 +71,11 @@ final class PacketStream
      */
     public function peekPacketType(): ?int
     {
-        if ($this->buffer === '') {
+        if ($this->offset >= strlen($this->buffer)) {
             return null;
         }
 
-        return ord($this->buffer[0]) >> 4;
+        return ord($this->buffer[$this->offset]) >> 4;
     }
 
     public function hasCompletePacket(): bool
@@ -65,7 +85,7 @@ final class PacketStream
             return false;
         }
 
-        return strlen($this->buffer) >= $size;
+        return $this->getBufferLength() >= $size;
     }
 
     /**
@@ -75,22 +95,22 @@ final class PacketStream
     private function totalPacketSize(): ?int
     {
         $length = strlen($this->buffer);
-        if ($length < 2) {
+        if ($length - $this->offset < 2) {
             return null;
         }
 
-        $offset = 1;
+        $position = $this->offset + 1;
         $multiplier = 1;
         $remainingLength = 0;
 
         do {
-            if ($offset >= $length) {
+            if ($position >= $length) {
                 return null;
             }
 
-            $byte = ord($this->buffer[$offset]);
+            $byte = ord($this->buffer[$position]);
             $remainingLength += ($byte & 0x7F) * $multiplier;
-            $offset++;
+            $position++;
 
             if ($multiplier > self::VARIABLE_BYTE_INT_MAX_MULTIPLIER) {
                 throw new MalformedPacketException('Malformed remaining length');
@@ -99,7 +119,7 @@ final class PacketStream
             $multiplier *= 128;
         } while (($byte & 0x80) !== 0);
 
-        $totalSize = $offset + $remainingLength;
+        $totalSize = ($position - $this->offset) + $remainingLength;
 
         // Reject an oversized packet as soon as its declared length is known, rather
         // than buffering toward a limit it can never satisfy.
@@ -117,18 +137,17 @@ final class PacketStream
     public function nextPacket(): string
     {
         $totalSize = $this->totalPacketSize();
-        $length = strlen($this->buffer);
 
-        if ($totalSize === null || $length < $totalSize) {
+        if ($totalSize === null || $this->getBufferLength() < $totalSize) {
             throw new MalformedPacketException('No complete packet in buffer');
         }
 
-        $packet = substr($this->buffer, 0, $totalSize);
+        $packet = substr($this->buffer, $this->offset, $totalSize);
+        $this->offset += $totalSize;
 
-        if ($totalSize >= $length) {
+        if ($this->offset >= strlen($this->buffer)) {
             $this->buffer = '';
-        } else {
-            $this->buffer = substr($this->buffer, $totalSize);
+            $this->offset = 0;
         }
 
         return $packet;
@@ -136,11 +155,12 @@ final class PacketStream
 
     public function getBufferLength(): int
     {
-        return strlen($this->buffer);
+        return strlen($this->buffer) - $this->offset;
     }
 
     public function clear(): void
     {
         $this->buffer = '';
+        $this->offset = 0;
     }
 }

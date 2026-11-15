@@ -17,6 +17,9 @@ final class ScriptedStream implements ConnectionStream
 
     public bool $closed = false;
 
+    /** What write() reports: false is ReactPHP saying its buffer is over the soft limit. */
+    public bool $writeResult = true;
+
     /** @var list<callable(string): void> */
     private array $dataHandlers = [];
 
@@ -35,9 +38,11 @@ final class ScriptedStream implements ConnectionStream
         }
     }
 
-    public function write(string $data): void
+    public function write(string $data): bool
     {
         $this->writes[] = $data;
+
+        return $this->writeResult;
     }
 
     public function close(): void

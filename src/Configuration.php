@@ -37,6 +37,17 @@ final class Configuration
      * @param ?string $retainedStatePath File the retained messages are kept in
      *                                   across restarts. Null keeps them in memory
      *                                   only, where a restart drops them.
+     * @param int $maxFiltersPerSubscribe Topic filters acted on per SUBSCRIBE; the rest
+     *                                    are refused. One packet used to be able to
+     *                                    name hundreds of thousands.
+     * @param int $maxOutboundBufferBytes Backlog tolerated for a client that is not
+     *                                    reading before it is disconnected.
+     * @param int $maxConnectPacketSize Largest packet accepted before CONNECT succeeds.
+     *                                  An unauthenticated peer has proven nothing, so it
+     *                                  does not get the full $maxPacketSize.
+     * @param int $maxInflightMessages QoS 1/2 messages sent to a client and not yet
+     *                                 acknowledged. Applied to 3.1.1 clients, which have
+     *                                 no Receive Maximum, and caps a 5.0 client's own.
      */
     public function __construct(
         public readonly string $host = '0.0.0.0',
@@ -61,6 +72,10 @@ final class Configuration
         public readonly ?string $tlsCiphers = null,
         public readonly int $tlsMinVersion = STREAM_CRYPTO_METHOD_TLSv1_2_SERVER,
         public readonly ?string $retainedStatePath = null,
+        public readonly int $maxFiltersPerSubscribe = 128,
+        public readonly int $maxOutboundBufferBytes = 8 * 1024 * 1024,
+        public readonly int $maxConnectPacketSize = 64 * 1024,
+        public readonly int $maxInflightMessages = 64,
     ) {
     }
 

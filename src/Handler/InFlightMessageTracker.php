@@ -82,22 +82,53 @@ final class InFlightMessageTracker
         return count($this->incomingQoS2[$clientId] ?? []);
     }
 
-    /** PUBACK settles a QoS 1 message outright. */
-    public function acknowledgeOutgoing(string $clientId, int $packetId): void
+    /**
+     * PUBACK settles a QoS 1 message outright.
+     *
+     * @return bool Whether the id was actually in flight. Acknowledgements are client
+     *              input: one for an id that was never sent must not count as a freed
+     *              slot, or a client can hold its flow-control window open forever.
+     */
+    public function acknowledgeOutgoing(string $clientId, int $packetId): bool
     {
+        if (!isset($this->outgoing[$clientId][$packetId])) {
+            return false;
+        }
+
         unset($this->outgoing[$clientId][$packetId]);
+
+        return true;
     }
 
-    /** PUBREC moves a QoS 2 message from "unacknowledged" to "awaiting PUBCOMP". */
-    public function awaitPubcomp(string $clientId, int $packetId): void
+    /**
+     * PUBREC moves a QoS 2 message from "unacknowledged" to "awaiting PUBCOMP".
+     *
+     * @return bool Whether the id was in flight; an unknown one is not recorded.
+     */
+    public function awaitPubcomp(string $clientId, int $packetId): bool
     {
+        if (!isset($this->outgoing[$clientId][$packetId])) {
+            return false;
+        }
+
         unset($this->outgoing[$clientId][$packetId]);
         $this->awaitingPubcomp[$clientId][$packetId] = true;
+
+        return true;
     }
 
-    public function completeOutgoing(string $clientId, int $packetId): void
+    /**
+     * @return bool Whether the id was awaiting PUBCOMP.
+     */
+    public function completeOutgoing(string $clientId, int $packetId): bool
     {
+        if (!isset($this->awaitingPubcomp[$clientId][$packetId])) {
+            return false;
+        }
+
         unset($this->awaitingPubcomp[$clientId][$packetId]);
+
+        return true;
     }
 
     /**

@@ -16,9 +16,11 @@ final class RecordingStream implements ConnectionStream
 
     public bool $closed = false;
 
-    public function write(string $data): void
+    public function write(string $data): bool
     {
         $this->writes[] = $data;
+
+        return true;
     }
 
     public function close(): void

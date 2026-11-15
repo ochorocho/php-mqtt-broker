@@ -161,10 +161,18 @@ final class Broker
         }
 
         $connection = new Connection(
-            $stream,
-            $this->packetEncoder,
-            $this->server->getLoop(),
-            $this->config->maxPacketSize,
+            stream: $stream,
+            encoder: $this->packetEncoder,
+            loop: $this->server->getLoop(),
+            // Raised to maxPacketSize by the handler once CONNECT succeeds.
+            maxPacketSize: min($this->config->maxConnectPacketSize, $this->config->maxPacketSize),
+            maxOutboundBufferBytes: $this->config->maxOutboundBufferBytes,
+            onOverflow: function (Connection $conn): void {
+                $this->logger->warning('Disconnecting {client}: outbound buffer exceeded {limit} bytes, client is not reading', [
+                    'client' => self::clientForLog($conn),
+                    'limit' => $this->config->maxOutboundBufferBytes,
+                ]);
+            },
         );
         $this->connectionManager->add($connection);
 

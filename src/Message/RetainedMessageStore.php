@@ -18,6 +18,13 @@ final class RetainedMessageStore
     private bool $dirty = false;
 
     /**
+     * The retained topics as a tree of levels, so a lookup walks only the branches a
+     * filter can reach. Scanning every topic per filter made one small SUBSCRIBE of
+     * 128 filters cost a quarter of a second against 10k retained messages.
+     */
+    private readonly TopicNode $index;
+
+    /**
      * Retained messages persist until overwritten, so without bounds any client can
      * pin unlimited attacker-chosen data in memory for the life of the process.
      */
@@ -25,6 +32,7 @@ final class RetainedMessageStore
         private readonly int $maxMessages = 10000,
         private readonly int $maxBytes = 67108864,
     ) {
+        $this->index = new TopicNode();
     }
 
     /**
@@ -44,6 +52,10 @@ final class RetainedMessageStore
             return false;
         }
 
+        if ($existing === null) {
+            $this->indexAdd($topic);
+        }
+
         $this->messages[$topic] = $packet;
         $this->totalBytes += $delta;
         $this->dirty = true;
@@ -57,6 +69,7 @@ final class RetainedMessageStore
         if ($existing !== null) {
             $this->totalBytes -= strlen($existing->payload);
             unset($this->messages[$topic]);
+            self::indexRemove($this->index, explode('/', $topic), 0);
             $this->dirty = true;
         }
     }
@@ -88,26 +101,103 @@ final class RetainedMessageStore
     }
 
     /**
-     * @return PublishPacket[]
+     * The retained messages a topic filter matches, by the rules of TopicFilter::matches.
+     *
+     * @return list<PublishPacket>
      */
     public function getMatching(string $topicFilter): array
     {
-        $results = [];
+        $topics = [];
+        self::collect($this->index, explode('/', TopicFilter::stripSharedPrefix($topicFilter)), 0, $topics);
 
-        foreach ($this->messages as $topic => $packet) {
-            if ($this->topicMatchesFilter($topic, $topicFilter)) {
-                $results[] = $packet;
+        return array_map(fn(string $topic): PublishPacket => $this->messages[$topic], $topics);
+    }
+
+    private function indexAdd(string $topic): void
+    {
+        $node = $this->index;
+        foreach (explode('/', $topic) as $level) {
+            $node = $node->children[$level] ??= new TopicNode();
+        }
+        $node->topic = $topic;
+    }
+
+    /**
+     * Clear a topic and prune the nodes it leaves empty.
+     *
+     * @param list<string> $levels
+     * @return bool Whether this node is now empty and may be dropped by its parent.
+     */
+    private static function indexRemove(TopicNode $node, array $levels, int $depth): bool
+    {
+        if ($depth === count($levels)) {
+            $node->topic = null;
+        } else {
+            $child = $node->children[$levels[$depth]] ?? null;
+            if ($child !== null && self::indexRemove($child, $levels, $depth + 1)) {
+                unset($node->children[$levels[$depth]]);
             }
         }
 
-        return $results;
+        return $node->isEmpty();
     }
 
-    private function topicMatchesFilter(string $topicName, string $topicFilter): bool
+    /**
+     * @param list<string> $levels Filter levels.
+     * @param list<string> $topics Collected topics.
+     * @param-out list<string> $topics
+     */
+    private static function collect(TopicNode $node, array $levels, int $depth, array &$topics): void
     {
-        // Matching lives in one place. This used to be a second, independently written
-        // implementation, so retained delivery and live routing could disagree about
-        // which subscribers a topic reaches.
-        return TopicFilter::matches($topicName, $topicFilter);
+        if ($depth === count($levels)) {
+            if ($node->topic !== null) {
+                $topics[] = $node->topic;
+            }
+            return;
+        }
+
+        $level = $levels[$depth];
+
+        if ($level === '#') {
+            // '#' also matches the parent level, so 'sport/#' matches 'sport'.
+            if ($node->topic !== null) {
+                $topics[] = $node->topic;
+            }
+            self::collectDescendants($node, $depth === 0, $topics);
+            return;
+        }
+
+        if ($level === '+') {
+            foreach ($node->children as $key => $child) {
+                // A wildcard at the first level does not match '$' topics (MQTT-4.7.2-1).
+                if ($depth === 0 && str_starts_with((string) $key, '$')) {
+                    continue;
+                }
+                self::collect($child, $levels, $depth + 1, $topics);
+            }
+            return;
+        }
+
+        $child = $node->children[$level] ?? null;
+        if ($child !== null) {
+            self::collect($child, $levels, $depth + 1, $topics);
+        }
+    }
+
+    /**
+     * @param list<string> $topics
+     * @param-out list<string> $topics
+     */
+    private static function collectDescendants(TopicNode $node, bool $skipDollar, array &$topics): void
+    {
+        foreach ($node->children as $key => $child) {
+            if ($skipDollar && str_starts_with((string) $key, '$')) {
+                continue;
+            }
+            if ($child->topic !== null) {
+                $topics[] = $child->topic;
+            }
+            self::collectDescendants($child, false, $topics);
+        }
     }
 }

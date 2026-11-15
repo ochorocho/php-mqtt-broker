@@ -15,6 +15,8 @@ use React\EventLoop\TimerInterface;
 
 final class Connection
 {
+    public const int DEFAULT_MAX_OUTBOUND_BUFFER_BYTES = 8 * 1024 * 1024;
+
     private readonly PacketStream $packetStream;
     private ?string $clientId = null;
     private ProtocolVersion $protocolVersion = ProtocolVersion::V311;
@@ -47,11 +49,23 @@ final class Connection
     private bool $disconnectHandled = false;
     private bool $closed = false;
 
+    /** Bytes written while the transport reported backpressure, since it last drained. */
+    private int $congestedBytes = 0;
+
+    /**
+     * @param int $maxPacketSize Initial inbound packet limit. The broker starts low and
+     *                           raises it once CONNECT has succeeded.
+     * @param int $maxOutboundBufferBytes Backlog tolerated for a peer that is not
+     *                                    reading before the connection is closed.
+     * @param (\Closure(Connection): void)|null $onOverflow Told before such a close.
+     */
     public function __construct(
         private readonly ConnectionStream $stream,
         private readonly PacketEncoder $encoder,
         private readonly LoopInterface $loop,
         int $maxPacketSize = PacketStream::DEFAULT_MAX_PACKET_SIZE,
+        private readonly int $maxOutboundBufferBytes = self::DEFAULT_MAX_OUTBOUND_BUFFER_BYTES,
+        private readonly ?\Closure $onOverflow = null,
     ) {
         $this->packetStream = new PacketStream($maxPacketSize);
         $this->lastActivity = microtime(true);
@@ -67,9 +81,33 @@ final class Connection
         return $this->packetStream;
     }
 
+    /**
+     * Write a packet, closing the connection if the peer has fallen too far behind.
+     *
+     * The transport queues whatever it cannot send yet. QoS 0 has no flow control of
+     * its own, so a subscriber that stops reading would otherwise make the broker hold
+     * every message routed to it, without limit.
+     */
     public function send(PacketInterface $packet): void
     {
-        $this->stream->write($this->encoder->encode($packet));
+        if ($this->closed) {
+            return;
+        }
+
+        $bytes = $this->encoder->encode($packet);
+
+        if ($this->stream->write($bytes)) {
+            $this->congestedBytes = 0;
+            return;
+        }
+
+        $this->congestedBytes += strlen($bytes);
+        if ($this->congestedBytes > $this->maxOutboundBufferBytes) {
+            if ($this->onOverflow !== null) {
+                ($this->onOverflow)($this);
+            }
+            $this->close();
+        }
     }
 
     public function close(): void

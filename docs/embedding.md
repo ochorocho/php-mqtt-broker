@@ -355,7 +355,7 @@ interface ServerInterface
 
 interface ConnectionStream
 {
-    public function write(string $data): void;
+    public function write(string $data): bool;   // false = backpressure; see below
 
     public function close(): void;
 
@@ -367,21 +367,27 @@ interface ConnectionStream
 }
 ```
 
-`tests/Unit/Handler/RecordingStream.php` is a complete worked example in 41 lines: it
+`tests/Unit/Handler/RecordingStream.php` is a complete worked example in 43 lines: it
 collects writes into an array, records whether it was closed, and leaves `onData()` and
 `onClose()` as empty stubs — a double driven by the test rather than by a socket has
 nothing to register. Assertions then read what the broker wrote, decoded back into
 packets.
+
+To drive a whole `Broker` instead, `tests/Unit/Broker/` has a `FakeServer`, a
+`ScriptedStream` that keeps its handlers so a test can `push()` raw bytes, and a
+`FakeLoop` whose `run()` returns at once and whose timers fire only when the test
+calls `advance()` — so `start()` can be called in a test and timeouts are
+deterministic.
 
 The same shape gives you an alternative transport. Implement both interfaces over
 WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
 ## Configuration reference
 
-`Configuration` is a value object: 21 constructor parameters, all with defaults, all
-readonly. **Only seven are reachable from the CLI** — `host`, `port` and the five
-`--tls-*` options. The other fourteen can only be set by constructing it yourself,
-which is the main reason to embed the broker rather than run the binary.
+`Configuration` is a value object: 26 constructor parameters, all with defaults, all
+readonly. **Only eight are reachable from the CLI** — `host`, `port`, `--state-file`
+and the five `--tls-*` options. The others can only be set by constructing it
+yourself, which is the main reason to embed the broker rather than run the binary.
 
 ```php
 $config = new Configuration(
@@ -401,7 +407,9 @@ $config = new Configuration(
 | `port` | `int` | `1883` | Bind port. Use 8883 by convention when TLS is on. |
 | `maxConnections` | `int` | `10000` | Concurrent connections accepted; beyond this new sockets are closed immediately. Global, not per-IP. |
 | `connectTimeout` | `float` | `10.0` | Seconds a connection may stay open before sending CONNECT. Bounds what an unauthenticated peer can hold. |
-| `maxPacketSize` | `int` | `1048576` | Largest accepted inbound packet, in bytes. Also caps a connection's receive buffer, so a client cannot stream unbounded data without completing a packet. |
+| `maxPacketSize` | `int` | `1048576` | Largest accepted inbound packet, in bytes, once a client has connected. Also caps what a connection may leave buffered without completing a packet. |
+| `maxConnectPacketSize` | `int` | `65536` | Largest packet accepted *before* CONNECT succeeds. An unauthenticated peer has proven nothing, so it does not get `maxPacketSize`; at the old limit ten thousand of them could hold ten gigabytes. Raise it if clients send wills larger than this. |
+| `maxOutboundBufferBytes` | `int` | `8388608` | Backlog tolerated for a client that has stopped reading. Past it the client is disconnected and a `warning` is logged. Without it, a subscriber that never reads makes the broker keep every message routed to it. |
 | `maxClientIdLength` | `int` | `256` | Client identifier length in bytes. |
 
 ### Sessions and keep-alive
@@ -412,12 +420,14 @@ $config = new Configuration(
 | `maxSessions` | `int` | `10000` | Persistent sessions retained; the oldest idle session is evicted beyond this. |
 | `maxSessionExpiry` | `int` | `86400` | Ceiling for a session's expiry interval, in seconds. MQTT 3.1.1 sessions have no expiry of their own. |
 | `maxPendingMessagesPerSession` | `int` | `1000` | Offline queue depth per session. When full the oldest message is dropped and logged at `warning`. |
+| `maxInflightMessages` | `int` | `64` | QoS 1 and 2 messages sent to one client and not yet acknowledged. MQTT 3.1.1 has no Receive Maximum, so this is the whole limit there; a 5.0 client's own Receive Maximum applies when it is lower. Further messages wait in the session queue. |
 
 ### Subscriptions and retained messages
 
 | Parameter | Type | Default | Purpose |
 |---|---|---|---|
 | `maxSubscriptionsPerClient` | `int` | `1000` | Active subscriptions per client. |
+| `maxFiltersPerSubscribe` | `int` | `128` | Topic filters acted on in one SUBSCRIBE; the rest are refused (`0x80`, or `0x97` Quota exceeded in 5.0). A filter named twice in one packet has its retained messages sent once. |
 | `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic or filter. |
 | `maxRetainedMessages` | `int` | `10000` | Distinct retained topics. |
 | `maxRetainedBytes` | `int` | `67108864` | Total retained payload bytes — the real memory bound, since everything is in-process. |
@@ -441,3 +451,11 @@ Three server-side values are compile-time constants, despite appearing in the fe
 list as though they were tunable: the server's Receive Maximum is 20, its Topic Alias
 Maximum is 10, and the Server Keep Alive it advertises to MQTT 5.0 clients is 60
 seconds.
+
+### Custom transports
+
+`ConnectionStream::write()` returns `bool`: `false` means the transport is buffering
+past its soft limit because the peer is not keeping up. The data must still be
+queued. The broker counts the bytes written while it keeps answering `false` and
+disconnects past `maxOutboundBufferBytes`. A transport that cannot tell should return
+`true`.
