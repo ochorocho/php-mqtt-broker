@@ -50,15 +50,34 @@ final class InFlightMessageTracker
      * Sending, recording and incrementing the flow-control counter have to happen
      * together: a site that sends without recording leaves the counter drifting from
      * the outstanding messages, and flow control degrades for the rest of the session.
+     *
+     * @param ?PublishPacket $stored What to keep for redelivery, when it differs from what
+     *                               goes on the wire. A topic alias belongs to the
+     *                               connection it was sent on; a packet kept for a later
+     *                               connection must carry its topic name instead.
      */
-    public function sendTracked(Connection $connection, PublishPacket $packet, string $clientId): void
+    public function sendTracked(Connection $connection, PublishPacket $packet, string $clientId, ?PublishPacket $stored = null): void
     {
         $connection->send($packet);
 
         if ($packet->qos > 0 && $packet->packetId !== null) {
-            $this->outgoing[$clientId][$packet->packetId] = $packet;
+            $this->outgoing[$clientId][$packet->packetId] = $stored ?? $packet;
             $connection->incrementUnackedOutgoing();
         }
+    }
+
+    /**
+     * The given id if it is free, otherwise a newly allocated one. A message redelivered
+     * after a reconnect keeps its id (MQTT-4.4.0-1) unless something now in flight
+     * already uses it.
+     */
+    public function claimPacketId(string $clientId, ?int $preferred): int
+    {
+        if ($preferred !== null && $preferred > 0 && !$this->isInUse($clientId, $preferred)) {
+            return $preferred;
+        }
+
+        return $this->allocatePacketId($clientId);
     }
 
     /** A QoS 2 message held until its PUBREL arrives. */

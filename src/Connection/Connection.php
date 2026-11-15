@@ -385,6 +385,29 @@ final class Connection
     }
 
     /**
+     * The alias this topic would be sent with, without assigning one: a new alias must
+     * only be committed together with the packet that tells the client about it.
+     *
+     * @return array{alias: int, isNew: bool}|null
+     */
+    public function outgoingTopicAlias(string $topicName): ?array
+    {
+        if ($this->clientTopicAliasMaximum <= 0) {
+            return null;
+        }
+
+        if (isset($this->outgoingTopicAliases[$topicName])) {
+            return ['alias' => $this->outgoingTopicAliases[$topicName], 'isNew' => false];
+        }
+
+        if ($this->nextOutgoingTopicAlias > $this->clientTopicAliasMaximum) {
+            return null;
+        }
+
+        return ['alias' => $this->nextOutgoingTopicAlias, 'isNew' => true];
+    }
+
+    /**
      * @return array{alias: int, isNew: bool}|null
      */
     public function getOrCreateOutgoingTopicAlias(string $topicName): ?array

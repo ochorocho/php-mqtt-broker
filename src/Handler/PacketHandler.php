@@ -213,10 +213,19 @@ final class PacketHandler
             $session->disconnectedAt = microtime(true);
             $session->protocolVersion = $connection->getProtocolVersion();
 
-            // Save pending outgoing messages (QoS 1/2 not yet acknowledged)
-            // so they can be redelivered on reconnect
-            foreach ($this->inFlight->unacknowledged($clientId) as $pendingPacket) {
-                $this->queuePendingMessage($session, $pendingPacket);
+            // Messages sent and not yet acknowledged go back in front of the queue:
+            // they were sent before anything still waiting, and are redelivered first.
+            $unacknowledged = $this->inFlight->unacknowledged($clientId);
+            if ($unacknowledged !== []) {
+                $session->pendingMessages = array_merge($unacknowledged, $session->pendingMessages);
+                $overflow = count($session->pendingMessages) - $this->config->maxPendingMessagesPerSession;
+                if ($overflow > 0) {
+                    array_splice($session->pendingMessages, 0, $overflow);
+                    $this->logger->warning('Offline queue full for {clientId}, dropped {count} oldest message(s)', [
+                        'clientId' => LogSanitizer::forLog($clientId),
+                        'count' => $overflow,
+                    ]);
+                }
             }
 
             $this->inFlight->forget($clientId);
@@ -553,36 +562,12 @@ final class PacketHandler
         if ($sessionPresent) {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
-                foreach ($session->pendingMessages as $msg) {
-                    if ($version === ProtocolVersion::V50 && $msg->properties !== null) {
-                        $expiryInterval = $msg->properties->get(PropertyId::MessageExpiryInterval);
-                        if ($expiryInterval !== null && $session->disconnectedAt > 0.0) {
-                            $elapsed = (int) (microtime(true) - $session->disconnectedAt);
-                            $remaining = (int) $expiryInterval - $elapsed;
-                            if ($remaining <= 0) {
-                                continue; // Message expired, skip
-                            }
-                            $msg->properties->remove(PropertyId::MessageExpiryInterval);
-                            $msg->properties->set(PropertyId::MessageExpiryInterval, $remaining);
-                        }
-                    }
+                $session->pendingMessages = self::withoutExpired($session->pendingMessages, $session->disconnectedAt);
 
-                    $packetId = $msg->qos > 0
-                        ? ($msg->packetId ?? $this->inFlight->allocatePacketId($clientId))
-                        : null;
-                    $deliverMsg = new PublishPacket(
-                        topicName: $msg->topicName,
-                        payload: $msg->payload,
-                        qos: $msg->qos,
-                        dup: $msg->qos > 0,
-                        retain: $msg->retain,
-                        packetId: $packetId,
-                        protocolVersion: $connection->getProtocolVersion(),
-                        properties: $msg->properties,
-                    );
-                    $this->inFlight->sendTracked($connection, $deliverMsg, $clientId);
-                }
-                $session->pendingMessages = [];
+                // Through the drain path, so the client's Receive Maximum applies to the
+                // replay too; the rest follows as acknowledgements free the window. Every
+                // queued message used to be written at once.
+                $this->drainPendingMessages($connection, redelivery: true);
             }
         }
 
@@ -993,15 +978,13 @@ final class PacketHandler
                 continue;
             }
 
-            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
+            $this->sendPublish($connection, $deliverPacket, $clientId);
         }
     }
 
     /**
      * A 5.0 client may declare a maximum packet size it will accept (MQTT-3.1.2-24).
-     *
-     * Only for retained delivery, where the connection is live and its version is the
-     * one to trust. deliverToClient has its own check for a reason; see there.
+     * Checked on the form actually sent, against the live connection.
      */
     private function exceedsClientPacketSize(Connection $connection, PublishPacket $packet): bool
     {
@@ -1340,20 +1323,6 @@ final class PacketHandler
             $version = $session !== null ? $session->protocolVersion : ProtocolVersion::V311;
         }
 
-        $packetId = $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null;
-
-        $topicName = $originalPacket->topicName;
-        $aliasInfo = null;
-        if ($version === ProtocolVersion::V50 && $connection !== null) {
-            $aliasInfo = $connection->getOrCreateOutgoingTopicAlias($originalPacket->topicName);
-
-            // A new alias must carry the full topic name so the client can record it;
-            // an established one is sent as the alias alone.
-            if ($aliasInfo !== null && !$aliasInfo['isNew']) {
-                $topicName = '';
-            }
-        }
-
         $properties = null;
         if ($version === ProtocolVersion::V50) {
             $properties = new PropertyCollection();
@@ -1362,48 +1331,31 @@ final class PacketHandler
                 $this->forwardProperties($originalPacket->properties, $properties);
             }
 
-            if ($aliasInfo !== null) {
-                $properties->set(PropertyId::TopicAlias, $aliasInfo['alias']);
-            }
-
             foreach ($subscriptionIds as $subId) {
                 $properties->set(PropertyId::SubscriptionIdentifier, $subId);
             }
         }
 
-        $retainFlag = $retainAsPublished ? $originalPacket->retain : false;
-
+        // Built with the topic name, never an alias: this is also the form kept when the
+        // message has to wait, possibly for a later connection. sendPublish() applies an
+        // alias on the way out.
         $deliverPacket = new PublishPacket(
-            topicName: $topicName,
+            topicName: $originalPacket->topicName,
             payload: $originalPacket->payload,
             qos: $qos,
-            retain: $retainFlag,
-            packetId: $packetId,
+            retain: $retainAsPublished ? $originalPacket->retain : false,
+            packetId: $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null,
             protocolVersion: $version,
             properties: $properties,
         );
 
-        // Deliberately not exceedsClientPacketSize(): this path keys on $version, which
-        // for an offline client comes from the saved session rather than the connection.
-        // The two look like the same check and are not.
-        if ($version === ProtocolVersion::V50 && $connection !== null && $connection->getClientMaximumPacketSize() > 0) {
-            $encoded = $this->packetEncoder->encode($deliverPacket);
-            if (strlen($encoded) > $connection->getClientMaximumPacketSize()) {
-                return; // Silently drop — must not send packets exceeding client's max
-            }
-        }
-
         if ($connection !== null && $connection->isConnected()) {
             if ($qos > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
-                $session = $this->sessionManager->get($clientId);
-                if ($session === null) {
-                    $session = $this->sessionManager->getOrCreate($clientId);
-                }
-                $this->queuePendingMessage($session, $deliverPacket);
+                $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
                 return;
             }
 
-            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
+            $this->sendPublish($connection, $deliverPacket, $clientId);
         } else {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
@@ -1413,9 +1365,120 @@ final class PacketHandler
     }
 
     /**
-     * Drain queued messages when flow control window opens.
+     * Send a PUBLISH in the form this connection needs.
+     *
+     * Two things belong to the connection rather than the message: its protocol version
+     * and its topic aliases. A message kept for later - queued past the window, or
+     * unacknowledged when the client left - may go out on another connection, so it is
+     * stored without them and they are applied here, to the copy on the wire. Stored
+     * with an alias, it was replayed as an alias the new connection had never set.
      */
-    private function drainPendingMessages(Connection $connection): void
+    private function sendPublish(Connection $connection, PublishPacket $packet, string $clientId): void
+    {
+        $version = $connection->getProtocolVersion();
+        if ($packet->protocolVersion !== $version) {
+            $packet = new PublishPacket(
+                topicName: $packet->topicName,
+                payload: $packet->payload,
+                qos: $packet->qos,
+                dup: $packet->dup,
+                retain: $packet->retain,
+                packetId: $packet->packetId,
+                protocolVersion: $version,
+                properties: $packet->properties,
+            );
+        }
+
+        $wire = $packet;
+        $commitAlias = false;
+        $alias = $version === ProtocolVersion::V50 ? $connection->outgoingTopicAlias($packet->topicName) : null;
+        if ($alias !== null) {
+            $properties = $packet->properties?->copy() ?? new PropertyCollection();
+            $properties->set(PropertyId::TopicAlias, $alias['alias']);
+
+            $aliased = new PublishPacket(
+                // A new alias carries the topic name so the client can record it; an
+                // established one is sent as the alias alone.
+                topicName: $alias['isNew'] ? $packet->topicName : '',
+                payload: $packet->payload,
+                qos: $packet->qos,
+                dup: $packet->dup,
+                retain: $packet->retain,
+                packetId: $packet->packetId,
+                protocolVersion: $version,
+                properties: $properties,
+            );
+
+            if (!$this->exceedsClientPacketSize($connection, $aliased)) {
+                $wire = $aliased;
+                $commitAlias = $alias['isNew'];
+            }
+        }
+
+        if ($this->exceedsClientPacketSize($connection, $wire)) {
+            return; // Must not send a packet larger than the client accepts; drop it.
+        }
+
+        // Only now: an alias assigned to a packet that is then dropped would be one the
+        // client never learns, and every later message on that topic would name it.
+        if ($commitAlias) {
+            $connection->getOrCreateOutgoingTopicAlias($packet->topicName);
+        }
+
+        $this->inFlight->sendTracked($connection, $wire, $clientId, $packet);
+    }
+
+    /**
+     * Queued messages whose Message Expiry Interval has not run out while the client was
+     * away, each with the interval reduced by the time it waited (MQTT-3.3.2-6).
+     *
+     * @param PublishPacket[] $messages
+     * @return list<PublishPacket>
+     */
+    private static function withoutExpired(array $messages, float $disconnectedAt): array
+    {
+        $elapsed = $disconnectedAt > 0.0 ? (int) (microtime(true) - $disconnectedAt) : 0;
+        $kept = [];
+
+        foreach ($messages as $message) {
+            $interval = $message->properties?->get(PropertyId::MessageExpiryInterval);
+            if ($message->properties === null || $interval === null || $elapsed === 0) {
+                $kept[] = $message;
+                continue;
+            }
+
+            $remaining = (int) $interval - $elapsed;
+            if ($remaining <= 0) {
+                continue;
+            }
+
+            $properties = $message->properties->copy();
+            $properties->remove(PropertyId::MessageExpiryInterval);
+            $properties->set(PropertyId::MessageExpiryInterval, $remaining);
+
+            $kept[] = new PublishPacket(
+                topicName: $message->topicName,
+                payload: $message->payload,
+                qos: $message->qos,
+                dup: $message->dup,
+                retain: $message->retain,
+                packetId: $message->packetId,
+                protocolVersion: $message->protocolVersion,
+                properties: $properties,
+            );
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Send queued messages while the client's flow-control window has room.
+     *
+     * @param bool $redelivery The client has just reconnected: QoS 1/2 messages keep
+     *                         their packet id where it is still free (MQTT-4.4.0-1) and
+     *                         are marked DUP. Otherwise each gets a fresh id.
+     */
+    private function drainPendingMessages(Connection $connection, bool $redelivery = false): void
     {
         $clientId = $connection->getClientId();
         if ($clientId === null) {
@@ -1427,22 +1490,26 @@ final class PacketHandler
             return;
         }
 
-        while ($session->pendingMessages !== [] && ($connection->getUnackedOutgoing() < $connection->getReceiveMaximum())) {
+        while ($session->pendingMessages !== []
+            && !$connection->isClosed()
+            && $connection->getUnackedOutgoing() < $connection->getReceiveMaximum()
+        ) {
             $msg = array_shift($session->pendingMessages);
             if ($msg->qos > 0) {
-                $packetId = $this->inFlight->allocatePacketId($clientId);
                 $msg = new PublishPacket(
                     topicName: $msg->topicName,
                     payload: $msg->payload,
                     qos: $msg->qos,
-                    dup: false,
+                    dup: $redelivery,
                     retain: $msg->retain,
-                    packetId: $packetId,
+                    packetId: $redelivery
+                        ? $this->inFlight->claimPacketId($clientId, $msg->packetId)
+                        : $this->inFlight->allocatePacketId($clientId),
                     protocolVersion: $msg->protocolVersion,
                     properties: $msg->properties,
                 );
             }
-            $this->inFlight->sendTracked($connection, $msg, $clientId);
+            $this->sendPublish($connection, $msg, $clientId);
         }
     }
 

@@ -41,6 +41,14 @@ final class PropertyCollection
         return $this->properties === [];
     }
 
+    public function copy(): self
+    {
+        $copy = new self();
+        $copy->properties = $this->properties;
+
+        return $copy;
+    }
+
     /**
      * A copy holding only the properties that travel with an application message, or
      * null when none are left.
