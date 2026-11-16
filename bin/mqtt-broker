@@ -34,6 +34,7 @@ $options = getopt('', [
     'tls-cert:',
     'tls-key:',
     'tls-passphrase:',
+    'tls-passphrase-file:',
     'tls-client-ca:',
     'tls-require-client-cert',
     'tls-identity-as-username',
@@ -86,7 +87,11 @@ if ($flag('help')) {
     TLS:
       --tls-cert=PATH          Server certificate (enables TLS)
       --tls-key=PATH           Private key
-      --tls-passphrase=SECRET  Passphrase for an encrypted key
+      --tls-passphrase-file=PATH
+                               Read the passphrase for an encrypted key from the
+                               first line of a file (with systemd: LoadCredential=)
+      --tls-passphrase=SECRET  The same on the command line, where every user on the
+                               host can read it from the process list. Avoid.
       --tls-require-client-cert  Require and verify a client certificate
       --tls-client-ca=PATH     CA bundle used to verify client certificates
 
@@ -97,6 +102,43 @@ if ($flag('help')) {
 
     USAGE;
     exit(0);
+}
+
+// A passphrase on the command line is in the process list, the shell history and the
+// unit file. A file - systemd's LoadCredential= puts one where only the service reads
+// it - is not.
+$tlsPassphrase = $str('tls-passphrase');
+$tlsPassphraseFile = $str('tls-passphrase-file');
+
+if ($tlsPassphrase !== null && $tlsPassphraseFile !== null) {
+    fwrite(STDERR, "--tls-passphrase cannot be combined with --tls-passphrase-file\n");
+    exit(1);
+}
+
+if ($tlsPassphrase !== null) {
+    fwrite(STDERR, "Warning: --tls-passphrase is visible to every user in the process list; "
+        . "use --tls-passphrase-file instead\n");
+}
+
+if ($tlsPassphraseFile !== null) {
+    $contents = is_file($tlsPassphraseFile) && is_readable($tlsPassphraseFile)
+        ? file_get_contents($tlsPassphraseFile)
+        : false;
+    if ($contents === false) {
+        fwrite(STDERR, sprintf("Failed to start: TLS passphrase file is not readable: %s\n", $tlsPassphraseFile));
+        exit(1);
+    }
+
+    $tlsPassphrase = rtrim(explode("\n", $contents, 2)[0], "\r");
+    if ($tlsPassphrase === '') {
+        fwrite(STDERR, sprintf("Failed to start: TLS passphrase file is empty: %s\n", $tlsPassphraseFile));
+        exit(1);
+    }
+
+    $mode = fileperms($tlsPassphraseFile);
+    if ($mode !== false && ($mode & 0o077) !== 0) {
+        fwrite(STDERR, sprintf("Warning: %s is readable by other users (mode %04o)\n", $tlsPassphraseFile, $mode & 0o7777));
+    }
 }
 
 $passwordFile = $str('password-file');
@@ -144,7 +186,7 @@ $config = new Configuration(
     port: (int) ($options['port'] ?? ($tlsCert !== null ? 8883 : 1883)),
     tlsCertPath: $tlsCert,
     tlsKeyPath: $str('tls-key'),
-    tlsKeyPassphrase: $str('tls-passphrase'),
+    tlsKeyPassphrase: $tlsPassphrase,
     tlsRequireClientCert: $flag('tls-require-client-cert'),
     tlsIdentityAsUsername: $certificateIdentity,
     tlsClientCaPath: $str('tls-client-ca'),

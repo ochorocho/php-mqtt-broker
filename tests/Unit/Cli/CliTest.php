@@ -63,6 +63,55 @@ final class CliTest extends TestCase
         self::assertStringContainsString('--allow-anonymous', $stderr);
     }
 
+    public function testAPassphraseOnTheCommandLineWarns(): void
+    {
+        // Every user on the host can read it from the process list.
+        [, , $stderr] = $this->execute('bin/mqtt-broker', ['--tls-passphrase=secret']);
+
+        self::assertStringContainsString('process list', $stderr);
+        self::assertStringContainsString('--tls-passphrase-file', $stderr);
+    }
+
+    public function testThePassphraseCanBeReadFromAFile(): void
+    {
+        $file = $this->directory . '/passphrase';
+        file_put_contents($file, "secret\n");
+        chmod($file, 0600);
+
+        // Gets as far as the certificate, so the passphrase file itself was accepted.
+        [$exit, , $stderr] = $this->execute('bin/mqtt-broker', [
+            '--tls-passphrase-file=' . $file,
+            '--tls-cert=' . $this->directory . '/missing.crt',
+            '--allow-anonymous',
+        ]);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('certificate is not readable', $stderr);
+        self::assertStringNotContainsString('passphrase', $stderr);
+    }
+
+    public function testAnUnreadablePassphraseFileIsAnError(): void
+    {
+        [$exit, , $stderr] = $this->execute('bin/mqtt-broker', [
+            '--tls-passphrase-file=' . $this->directory . '/missing',
+            '--allow-anonymous',
+        ]);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('passphrase file is not readable', $stderr);
+    }
+
+    public function testAPassphraseAndAPassphraseFileAreNotBothAccepted(): void
+    {
+        [$exit, , $stderr] = $this->execute('bin/mqtt-broker', [
+            '--tls-passphrase=secret',
+            '--tls-passphrase-file=' . $this->directory . '/passphrase',
+        ]);
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('cannot be combined', $stderr);
+    }
+
     public function testMqttPasswdWritesTheRequestedBcryptCost(): void
     {
         $file = $this->directory . '/passwd';

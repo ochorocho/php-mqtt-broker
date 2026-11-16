@@ -324,8 +324,16 @@ starts and refuses to start on an unreadable cert or key, rather than binding a
 listener that fails every handshake. A renewed certificate therefore does
 nothing until the service restarts, and there is no SIGHUP handler — wire your
 renewal to `systemctl restart mqtt-broker`. Keep the private key group-readable
-by the broker user and never world-readable, and avoid `--tls-passphrase`: it is
-visible in the process list and in the unit file.
+by the broker user and never world-readable. For an encrypted key, give the
+passphrase in a file rather than as `--tls-passphrase`, which every user on the
+host can read from the process list. With systemd, a credential keeps it out of
+the unit file too:
+
+```ini
+LoadCredential=tls-passphrase:/etc/mqtt/tls/passphrase
+ExecStart=/usr/bin/php /opt/mqtt-broker/bin/mqtt-broker ... \
+  --tls-passphrase-file=${CREDENTIALS_DIRECTORY}/tls-passphrase
+```
 
 **Restrict who can reach the port.** See the limitations below for why this
 matters more here than for a mature broker.
