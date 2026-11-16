@@ -58,6 +58,11 @@ final class Configuration
      * @param int $maxTopicLength Bytes in a topic name or filter. MQTT allows 65535; one
      *                            client's thousand subscriptions at that length are
      *                            64 MiB of routing table.
+     * @param int $maxSessionsPerUsername Sessions, live or offline, one account may hold.
+     *                                    Past it the account's own oldest offline session
+     *                                    is evicted; with every one live, the CONNECT is
+     *                                    refused. Sessions without a username count only
+     *                                    against $maxSessions. 0 disables.
      * @param bool $tlsIdentityAsUsername Use the common name of the verified client
      *                                    certificate as the username, whatever CONNECT
      *                                    says. Needs $tlsRequireClientCert.
@@ -93,6 +98,7 @@ final class Configuration
         public readonly float $authFailureWindow = 60.0,
         public readonly bool $tlsIdentityAsUsername = false,
         public readonly int $maxTopicLength = 4096,
+        public readonly int $maxSessionsPerUsername = 1000,
     ) {
     }
 

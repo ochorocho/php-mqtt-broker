@@ -424,7 +424,7 @@ WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
 ## Configuration reference
 
-`Configuration` is a value object: 30 constructor parameters, all with defaults, all
+`Configuration` is a value object: 31 constructor parameters, all with defaults, all
 readonly. **Only nine are reachable from the CLI** — `host`, `port`, `--state-file`
 and the six `--tls-*` options. The others can only be set by constructing it
 yourself, which is the main reason to embed the broker rather than run the binary.
@@ -459,7 +459,8 @@ $config = new Configuration(
 | Parameter | Type | Default | Purpose |
 |---|---|---|---|
 | `minKeepAlive` | `int` | `300` | Lower bound applied when a client requests keep-alive 0, which would otherwise never be reaped. |
-| `maxSessions` | `int` | `10000` | Persistent sessions retained; the oldest idle session is evicted beyond this. |
+| `maxSessions` | `int` | `10000` | Sessions held, live and offline; beyond this an offline one is evicted — the connecting account's own oldest first, then the oldest overall. |
+| `maxSessionsPerUsername` | `int` | `1000` | Sessions one account may hold, live and offline. Past it the account's own oldest offline session is evicted; with every one live, the CONNECT is refused (`0x97` Quota exceeded in 5.0, `0x03` Server unavailable in 3.1.1). Without it, one account churning client IDs could push every other account's offline sessions and queued messages out. Sessions without a username count only against `maxSessions`. `0` disables. |
 | `maxSessionExpiry` | `int` | `86400` | Ceiling for a session's expiry interval, in seconds. MQTT 3.1.1 sessions have no expiry of their own. |
 | `maxPendingMessagesPerSession` | `int` | `1000` | Offline queue depth per session. When full the oldest message is dropped and logged at `warning`. |
 | `maxInflightMessages` | `int` | `64` | QoS 1 and 2 messages sent to one client and not yet acknowledged. MQTT 3.1.1 has no Receive Maximum, so this is the whole limit there; a 5.0 client's own Receive Maximum applies when it is lower. Further messages wait in the session queue. |

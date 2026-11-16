@@ -90,6 +90,7 @@ final class PacketHandler
                 $this->subscriptionManager->removeClient($clientId);
                 $this->inFlight->forget($clientId);
             },
+            maxSessionsPerUsername: $this->config->maxSessionsPerUsername,
         );
         $this->authThrottle = new AuthFailureThrottle(
             maxFailures: $this->config->maxAuthFailuresPerHost,
@@ -475,6 +476,27 @@ final class PacketHandler
             return;
         }
 
+        // Checked before any takeover, so a refusal costs nothing. An account whose every
+        // session is live has none to give up for a new one.
+        if ($this->sessionManager->isOverQuota($clientId, $username)) {
+            $this->logger->warning('Session quota of {limit} reached for {username}, client {clientId} refused', [
+                'limit' => $this->config->maxSessionsPerUsername,
+                'username' => LogSanitizer::forLog($username ?? ''),
+                'clientId' => LogSanitizer::forLog($clientId),
+            ]);
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                // 3.1.1 has no quota code; "server unavailable" at least invites a retry
+                // rather than suggesting the credentials are wrong.
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::QuotaExceeded->value
+                    : ConnectReasonCode::ServerUnavailable->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
         $existing = $this->connectionManager->getByClientId($clientId);
         if ($existing !== null) {
             $this->handleDisconnect($existing, false);
@@ -585,7 +607,7 @@ final class PacketHandler
         }
 
         // Pre-create session with protocol version so offline message delivery uses correct format
-        $preSession = $this->sessionManager->getOrCreate($clientId);
+        $preSession = $this->sessionManager->claim($clientId, $username);
         $preSession->protocolVersion = $version;
 
         $connackProps = null;
