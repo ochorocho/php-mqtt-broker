@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.3', '8.4']
+        php: ['8.3', '8.4', '8.5']
 
     steps:
       - uses: actions/checkout@v4
@@ -35,9 +35,13 @@ jobs:
         run: vendor/bin/phpunit
 
   paho-conformance:
-    name: Paho MQTT Conformance
+    name: Paho MQTT Conformance (PHP ${{ matrix.php }})
     runs-on: ubuntu-latest
     needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
 
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +49,7 @@ jobs:
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.4'
+          php-version: ${{ matrix.php }}
           extensions: sockets, pcntl
           coverage: none
 
