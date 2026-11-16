@@ -59,6 +59,15 @@ jobs:
       - name: Clone Paho MQTT testing suite
         run: git clone --depth 1 https://github.com/eclipse-paho/paho.mqtt.testing.git
 
+      # test_subscribe_options and test_request_response subscribe client b, then wait
+      # on client a's SUBACK - already received - and publish at once. b's SUBSCRIBE and
+      # a's PUBLISH then race over two sockets: when both land in one event-loop tick,
+      # a's is handled first and b misses the message (0 != 1). Wait on b's SUBACK.
+      - name: Fix the suite's SUBACK waits
+        run: |
+          sed -i '/bclient\.subscribe(/{n;s/waitfor(callback\.subscribeds/waitfor(callback2.subscribeds/;}' paho.mqtt.testing/interoperability/client_test5.py
+          git -C paho.mqtt.testing diff -U1
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
