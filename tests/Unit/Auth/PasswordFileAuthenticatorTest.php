@@ -63,8 +63,8 @@ final class PasswordFileAuthenticatorTest extends TestCase
     {
         $authenticator = new PasswordFileAuthenticator($this->users());
 
-        self::assertTrue($authenticator->canSubscribe('alice', 'any/#'));
-        self::assertTrue($authenticator->canPublish('alice', 'any/topic'));
+        self::assertTrue($authenticator->canSubscribe('alice', 'alice', 'any/#'));
+        self::assertTrue($authenticator->canPublish('alice', 'alice', 'any/topic'));
     }
 
     public function testClientIdIsBoundToTheAccountByDefault(): void
@@ -92,5 +92,61 @@ final class PasswordFileAuthenticatorTest extends TestCase
 
         self::assertTrue($authenticator->canUseClientId('esp-living-room', 'alice'));
         self::assertTrue($authenticator->canUseClientId('anything', null));
+    }
+
+    public function testALongerAccountOwnsTheClientIdsThatStartWithIt(): void
+    {
+        $authenticator = new PasswordFileAuthenticator([
+            'alice' => password_hash('a', PASSWORD_DEFAULT, ['cost' => 4]),
+            'alice-bob' => password_hash('b', PASSWORD_DEFAULT, ['cost' => 4]),
+        ]);
+
+        // "alice" owns "alice-*", but "alice-bob" is an account of its own: without the
+        // longest-owner rule, alice could evict alice-bob and inherit its sessions.
+        self::assertFalse($authenticator->canUseClientId('alice-bob', 'alice'));
+        self::assertFalse($authenticator->canUseClientId('alice-bob-phone', 'alice'));
+        self::assertTrue($authenticator->canUseClientId('alice-bob-phone', 'alice-bob'));
+        self::assertTrue($authenticator->canUseClientId('alice-phone', 'alice'));
+        self::assertTrue($authenticator->canUseClientId('alice', 'alice'));
+    }
+
+    public function testARepeatedSuccessfulLoginSkipsThePasswordHash(): void
+    {
+        $verifications = 0;
+        $authenticator = new PasswordFileAuthenticator(
+            users: $this->users(),
+            passwordVerifier: static function (string $password, string $hash) use (&$verifications): bool {
+                $verifications++;
+
+                return password_verify($password, $hash);
+            },
+        );
+
+        // bcrypt is deliberately slow and runs on the only event-loop thread: a fleet
+        // reconnecting after a restart used to block the broker for minutes.
+        self::assertTrue($authenticator->authenticate('alice', 'alice', self::PASSWORD));
+        self::assertTrue($authenticator->authenticate('alice-2', 'alice', self::PASSWORD));
+
+        self::assertSame(1, $verifications);
+    }
+
+    public function testTheCacheNeverAcceptsADifferentPassword(): void
+    {
+        $verifications = 0;
+        $authenticator = new PasswordFileAuthenticator(
+            users: $this->users(),
+            passwordVerifier: static function (string $password, string $hash) use (&$verifications): bool {
+                $verifications++;
+
+                return password_verify($password, $hash);
+            },
+        );
+
+        self::assertTrue($authenticator->authenticate('alice', 'alice', self::PASSWORD));
+        self::assertFalse($authenticator->authenticate('alice', 'alice', 'guess'));
+        self::assertFalse($authenticator->authenticate('alice', 'alice', self::PASSWORD . ' '));
+
+        // A miss is verified properly, so the cache changes speed and nothing else.
+        self::assertSame(3, $verifications);
     }
 }

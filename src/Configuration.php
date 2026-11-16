@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker;
 
 use PhpMqtt\Broker\Protocol\PacketStream;
+use PhpMqtt\Broker\Protocol\TopicFilter;
 
 final class Configuration
 {
@@ -22,9 +23,11 @@ final class Configuration
      *                              MQTT 3.1.1 sessions have no expiry of their own.
      * @param int $maxPendingMessagesPerSession Offline queue depth per session.
      * @param int $maxRetainedMessages Distinct retained topics.
-     * @param int $maxRetainedBytes Total retained payload bytes.
+     * @param int $maxRetainedBytes Total retained bytes: topic names, payloads and
+     *                              properties.
      * @param int $maxSubscriptionsPerClient Active subscriptions per client.
-     * @param int $maxTopicLevels Levels ('/'-separated) in a topic or filter.
+     * @param int $maxTopicLevels Levels ('/'-separated) in a topic name or filter; for a
+     *                            shared filter, in the filter behind `$share/<group>/`.
      * @param int $maxClientIdLength Client identifier length in bytes.
      * @param ?string $tlsKeyPassphrase Passphrase for an encrypted private key.
      * @param bool $tlsRequireClientCert Require and verify a client certificate
@@ -37,6 +40,32 @@ final class Configuration
      * @param ?string $retainedStatePath File the retained messages are kept in
      *                                   across restarts. Null keeps them in memory
      *                                   only, where a restart drops them.
+     * @param int $maxFiltersPerSubscribe Topic filters acted on per SUBSCRIBE; the rest
+     *                                    are refused. One packet used to be able to
+     *                                    name hundreds of thousands.
+     * @param int $maxOutboundBufferBytes Backlog tolerated for a client that is not
+     *                                    reading before it is disconnected.
+     * @param int $maxConnectPacketSize Largest packet accepted before CONNECT succeeds.
+     *                                  An unauthenticated peer has proven nothing, so it
+     *                                  does not get the full $maxPacketSize.
+     * @param int $maxInflightMessages QoS 1/2 messages sent to a client and not yet
+     *                                 acknowledged. Applied to 3.1.1 clients, which have
+     *                                 no Receive Maximum, and caps a 5.0 client's own.
+     * @param int $maxAuthFailuresPerHost Failed logins tolerated from one remote address
+     *                                    within $authFailureWindow before further attempts
+     *                                    are refused without being checked. 0 disables.
+     * @param float $authFailureWindow Seconds a failed login counts against its host.
+     * @param int $maxTopicLength Bytes in a topic name or filter. MQTT allows 65535; one
+     *                            client's thousand subscriptions at that length are
+     *                            64 MiB of routing table.
+     * @param int $maxSessionsPerUsername Sessions, live or offline, one account may hold.
+     *                                    Past it the account's own oldest offline session
+     *                                    is evicted; with every one live, the CONNECT is
+     *                                    refused. Sessions without a username count only
+     *                                    against $maxSessions. 0 disables.
+     * @param bool $tlsIdentityAsUsername Use the common name of the verified client
+     *                                    certificate as the username, whatever CONNECT
+     *                                    says. Needs $tlsRequireClientCert.
      */
     public function __construct(
         public readonly string $host = '0.0.0.0',
@@ -61,7 +90,30 @@ final class Configuration
         public readonly ?string $tlsCiphers = null,
         public readonly int $tlsMinVersion = STREAM_CRYPTO_METHOD_TLSv1_2_SERVER,
         public readonly ?string $retainedStatePath = null,
+        public readonly int $maxFiltersPerSubscribe = 128,
+        public readonly int $maxOutboundBufferBytes = 8 * 1024 * 1024,
+        public readonly int $maxConnectPacketSize = 64 * 1024,
+        public readonly int $maxInflightMessages = 64,
+        public readonly int $maxAuthFailuresPerHost = 10,
+        public readonly float $authFailureWindow = 60.0,
+        public readonly bool $tlsIdentityAsUsername = false,
+        public readonly int $maxTopicLength = 4096,
+        public readonly int $maxSessionsPerUsername = 1000,
     ) {
+    }
+
+    /**
+     * Whether a topic name or filter is longer or deeper than this broker accepts.
+     * Levels are counted behind a shared subscription's `$share/<group>/` prefix,
+     * which says who receives a message, not where it was published.
+     */
+    public function exceedsTopicLimits(string $topicOrFilter): bool
+    {
+        if (strlen($topicOrFilter) > $this->maxTopicLength) {
+            return true;
+        }
+
+        return substr_count(TopicFilter::stripSharedPrefix($topicOrFilter), '/') + 1 > $this->maxTopicLevels;
     }
 
     /**
@@ -143,6 +195,8 @@ final class Configuration
         }
 
         if ($this->tlsRequireClientCert) {
+            // Kept on the stream after the handshake, where the broker reads its name.
+            $tls['capture_peer_cert'] = true;
             $tls['verify_peer'] = true;
             $tls['verify_peer_name'] = false; // Clients are identified by cert, not hostname.
             $tls['allow_self_signed'] = false;
@@ -184,7 +238,17 @@ final class Configuration
      */
     public function validateTls(): void
     {
+        // Both settings are about client certificates, which only a TLS listener sees.
+        // Without one they were simply not enforced.
+        if ($this->tlsIdentityAsUsername && !$this->tlsRequireClientCert) {
+            throw new \RuntimeException('tlsIdentityAsUsername needs tlsRequireClientCert: an unverified certificate proves nothing');
+        }
+
         if (!$this->isTlsEnabled()) {
+            if ($this->tlsRequireClientCert) {
+                throw new \RuntimeException('tlsRequireClientCert needs tlsCertPath: without a certificate the listener is plaintext');
+            }
+
             return;
         }
 

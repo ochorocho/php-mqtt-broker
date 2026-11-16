@@ -6,7 +6,12 @@ namespace PhpMqtt\Broker\Server;
 
 interface ConnectionStream
 {
-    public function write(string $data): void;
+    /**
+     * @return bool False when the transport is buffering past its soft limit, i.e. the
+     *              peer is not keeping up. The data is still queued; the caller decides
+     *              how much backlog to tolerate.
+     */
+    public function write(string $data): bool;
 
     public function close(): void;
 

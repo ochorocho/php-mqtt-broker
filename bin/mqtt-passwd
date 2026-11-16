@@ -13,6 +13,7 @@ use PhpMqtt\Broker\Auth\PasswordFile;
 $batch = false;
 $delete = false;
 $wantsHelp = false;
+$cost = null;
 $positional = [];
 
 foreach (array_slice($argv, 1) as $argument) {
@@ -33,6 +34,15 @@ foreach (array_slice($argv, 1) as $argument) {
             $wantsHelp = true;
             break;
         default:
+            if (str_starts_with($argument, '--cost=')) {
+                $value = substr($argument, strlen('--cost='));
+                if (!ctype_digit($value) || (int) $value < 4 || (int) $value > 31) {
+                    fwrite(STDERR, "--cost must be a bcrypt cost between 4 and 31\n");
+                    exit(1);
+                }
+                $cost = (int) $value;
+                break;
+            }
             if (str_starts_with($argument, '-') && $argument !== '-') {
                 fwrite(STDERR, sprintf("Unknown option: %s\n", $argument));
                 exit(1);
@@ -54,6 +64,10 @@ if ($wantsHelp || $positional === []) {
                   scripts, but the password is visible in the process list and
                   the shell history.
       -D          Delete the named user.
+      --cost=N    bcrypt cost (4-31; PHP's default otherwise). Each login costs
+                  one hash on the broker's only thread, and doubling per step, so
+                  for long random device secrets a cost of 8-10 is plenty and
+                  keeps reconnect storms cheap. Human-chosen passwords want more.
       --help      Show this message.
 
     The file is created with mode 0600 if it does not exist. The broker reads it
@@ -79,6 +93,14 @@ if ($path === null || $username === null) {
 
 if ($username === '' || str_contains($username, ':')) {
     fwrite(STDERR, "Username must not be empty or contain ':'\n");
+    exit(1);
+}
+
+// Authorizers commonly scope topics and client IDs by username ("alice/#",
+// "alice-phone"): a username that is topic syntax, or invisible, breaks that scope.
+// Only new users are checked, so an existing file keeps loading.
+if (!$delete && preg_match('/[\/+#\x00-\x1F\x7F]/', $username) === 1) {
+    fwrite(STDERR, "Username must not contain '/', '+', '#' or control characters\n");
     exit(1);
 }
 
@@ -170,7 +192,7 @@ if ($delete) {
         fwrite(STDERR, "Warning: bcrypt only uses the first 72 bytes of this password\n");
     }
 
-    $users[$username] = password_hash($password, PASSWORD_DEFAULT);
+    $users[$username] = password_hash($password, PASSWORD_DEFAULT, $cost !== null ? ['cost' => $cost] : []);
 }
 
 ksort($users);

@@ -54,9 +54,9 @@ final class PublishPacket implements PacketInterface
         // name is only legal in 5.0 when a topic alias supplies it, which is resolved
         // by the handler.
         if ($topicName !== '' && !TopicFilter::isValidName($topicName)) {
-            throw new ProtocolViolationException(
-                sprintf('PUBLISH topic name must not contain wildcards: %s', $topicName),
-            );
+            // The topic is not quoted back: it is attacker-chosen, and this message
+            // ends up in the log.
+            throw new ProtocolViolationException('PUBLISH topic name must not contain wildcards');
         }
 
         $packetId = null;

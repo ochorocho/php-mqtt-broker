@@ -31,7 +31,7 @@ final class SubscriptionManager
 
         // Remove existing subscription for this client+topic if present
         if (isset($this->clientSubscriptions[$clientId][$topicFilter])) {
-            $this->topicMatcher->unsubscribe($matchFilter, $clientId);
+            $this->topicMatcher->unsubscribe($matchFilter, $clientId, $topicFilter);
         }
 
         $sub = new Subscription($clientId, $topicFilter, $qos, $noLocal, $retainAsPublished, $retainHandling, $subscriptionIdentifier);
@@ -44,7 +44,7 @@ final class SubscriptionManager
     public function unsubscribe(string $clientId, string $topicFilter): void
     {
         $matchFilter = self::getMatchFilter($topicFilter);
-        $this->topicMatcher->unsubscribe($matchFilter, $clientId);
+        $this->topicMatcher->unsubscribe($matchFilter, $clientId, $topicFilter);
         unset($this->clientSubscriptions[$clientId][$topicFilter]);
     }
 
@@ -61,7 +61,7 @@ final class SubscriptionManager
         // Walk only this client's own filters. The previous full-trie scan made every
         // disconnect cost O(entire trie), so a large trie slowed down all clients.
         foreach (array_keys($this->clientSubscriptions[$clientId] ?? []) as $topicFilter) {
-            $this->topicMatcher->unsubscribe(self::getMatchFilter($topicFilter), $clientId);
+            $this->topicMatcher->unsubscribe(self::getMatchFilter($topicFilter), $clientId, (string) $topicFilter);
         }
 
         unset($this->clientSubscriptions[$clientId]);

@@ -1,6 +1,6 @@
 # web_extra_daemons:
 #   - name: mqtt-broker
-#     command: "php /var/www/html/bin/mqtt-broker"
+#     command: "php /var/www/html/bin/mqtt-broker --allow-anonymous"
 #     directory: /var/www/html
 
 webimage_extra_packages:

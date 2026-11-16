@@ -26,14 +26,15 @@ installed with Composer, read them as `vendor/bin/`.
 ### Standalone (CLI)
 
 ```bash
-php bin/mqtt-broker
+php bin/mqtt-broker --password-file=/etc/mqtt/passwd
 ```
 
-The broker listens on `0.0.0.0:1883` by default and accepts anyone. Options:
+The broker listens on `0.0.0.0:1883` by default. It refuses to start without an
+authentication option: pass `--password-file` or `--auth`, or `--allow-anonymous`
+to accept every client without credentials on a development machine. Options:
 
 ```bash
-php bin/mqtt-broker --host=127.0.0.1 --port=1884
-php bin/mqtt-broker --password-file=/etc/mqtt/passwd   # require credentials
+php bin/mqtt-broker --allow-anonymous --host=127.0.0.1 --port=1884   # local development
 php bin/mqtt-broker --state-file=/var/lib/mqtt/retained.ndjson  # keep retained messages across restarts
 php bin/mqtt-broker --help                             # every option
 ```
@@ -72,8 +73,10 @@ to shut it down cleanly, or to implement an authenticator, see
 
 ### Authentication
 
-Without an authentication option the broker accepts every client, which is fine
-on a trusted network and wrong anywhere else. There are two ways to change that.
+The CLI needs one of three options. `--allow-anonymous` accepts every client
+without credentials: anyone who can reach the port can then read every topic and
+take over any client ID, so it is for development and test rigs only. The other
+two require credentials.
 
 #### Password file
 
@@ -93,9 +96,18 @@ Three things worth knowing before you deploy it:
 
 - **Client IDs are bound to the account.** `alice` may connect as `alice` or
   `alice-<anything>`, and nothing else. Without this, any valid account could
-  evict another client and inherit its session. Clients whose ID is unrelated to
-  their username — ESPHome sets `client_id` independently — either need their
-  `client_id` set to match, or the broker started with `--allow-any-client-id`.
+  evict another client and inherit its session. The most specific account wins:
+  if `alice-bob` is an account too, it owns `alice-bob` and `alice-bob-*`, and
+  `alice` cannot claim them. An empty client ID gets a broker-assigned one, which
+  belongs to no account. Clients whose ID is unrelated to their username — ESPHome
+  sets `client_id` independently — either need their `client_id` set to match, or
+  the broker started with `--allow-any-client-id`.
+- **Each login costs one bcrypt hash** on the broker's only thread — about 0.2 s at
+  PHP's default cost. A password that has verified once is remembered (as a keyed
+  hash, in memory) so a reconnecting device does not pay again, and a host that
+  fails 10 logins within a minute is refused without hashing until its failures
+  age out. For long random device secrets, `mqtt-passwd --cost=8` keeps the first
+  login cheap too.
 - **There are no per-topic rules.** Every authenticated client may publish and
   subscribe anywhere. If you need ACLs, use a custom authenticator below.
 - **The file is read once at startup.** Adding or removing a user takes effect on
@@ -146,10 +158,9 @@ credentials in extension configuration, not in source.
 
 The same interface is available when embedding the broker as a library, by passing
 `authenticator:` to `Broker`. Before you write one, read
-[the authenticator contract](docs/embedding.md#the-authenticator-contract): only
-`authenticate()` and `canUseClientId()` receive the username, so per-user topic rules
-need the client ID recorded against its account during `authenticate()`. That page has
-a worked example.
+[the authenticator contract](docs/embedding.md#the-authenticator-contract). Every
+method receives the username the connection authenticated with, so per-user topic
+rules need no bookkeeping of their own; that page has a worked example.
 
 ### TLS
 
@@ -167,7 +178,9 @@ $broker->start();
 
 TLS 1.2 is the minimum by default (TLS 1.3 is used when available). `start()`
 throws if the certificate or key cannot be read, rather than binding a listener
-that would fail every handshake.
+that would fail every handshake. A client gets `connectTimeout` (10 s) to finish
+its TLS handshake, and at most 1000 handshakes are pending at once; a socket that
+connects and sends nothing is closed rather than held.
 
 For mutual TLS, require a client certificate and give the CA bundle to verify
 it against:
@@ -187,10 +200,20 @@ $config = new Configuration(
 The CLI accepts the same options:
 
 ```bash
-php bin/mqtt-broker --tls-cert=/path/to/server.crt --tls-key=/path/to/server.key
+php bin/mqtt-broker --tls-cert=/path/to/server.crt --tls-key=/path/to/server.key --password-file=passwd
 php bin/mqtt-broker --tls-cert=server.crt --tls-key=server.key \
-    --tls-require-client-cert --tls-client-ca=ca.crt
+    --tls-require-client-cert --tls-client-ca=ca.crt --tls-identity-as-username
 ```
+
+A verified client certificate proves who the client is, but on its own it only
+decides who may complete the handshake: any holder of a certificate from that CA
+could still claim any username and any client ID. With
+`--tls-identity-as-username` (`tlsIdentityAsUsername: true`) the certificate's
+common name *is* the username, whatever CONNECT says. On its own it is the whole
+authentication — the CN `device-1` may connect as `device-1` or
+`device-1-<anything>`, as with a password file. Combined with `--password-file` or
+`--auth`, those check the certificate's name instead of a claimed one. A
+certificate without a single common name is refused.
 
 With `--tls-cert` the default port is 8883. Note that MQTT credentials are sent
 in the clear on a plaintext listener, so prefer TLS whenever clients
@@ -301,8 +324,16 @@ starts and refuses to start on an unreadable cert or key, rather than binding a
 listener that fails every handshake. A renewed certificate therefore does
 nothing until the service restarts, and there is no SIGHUP handler — wire your
 renewal to `systemctl restart mqtt-broker`. Keep the private key group-readable
-by the broker user and never world-readable, and avoid `--tls-passphrase`: it is
-visible in the process list and in the unit file.
+by the broker user and never world-readable. For an encrypted key, give the
+passphrase in a file rather than as `--tls-passphrase`, which every user on the
+host can read from the process list. With systemd, a credential keeps it out of
+the unit file too:
+
+```ini
+LoadCredential=tls-passphrase:/etc/mqtt/tls/passphrase
+ExecStart=/usr/bin/php /opt/mqtt-broker/bin/mqtt-broker ... \
+  --tls-passphrase-file=${CREDENTIALS_DIRECTORY}/tls-passphrase
+```
 
 **Restrict who can reach the port.** See the limitations below for why this
 matters more here than for a mature broker.
@@ -311,19 +342,27 @@ matters more here than for a mature broker.
 
 It is marked experimental at the top of this README, and these gaps are real:
 
-- **No rate limiting, and no per-IP accounting.** `ConnectionManager` does not
-  record remote addresses, so password guessing is unthrottled.
-- **Nothing slows a guessing run down.** A rejected login *is* logged — at
-  `warning`, with the username, the remote address and the client ID — but the
-  broker itself neither delays nor blocks the next attempt. Acting on those lines
-  is left to you. A fail2ban filter can match them:
+- **Connections are not limited per address.** `ConnectionManager` does not
+  record remote addresses, so one host can use every `maxConnections` slot.
+- **Login throttling is in-process only.** A host that fails
+  `maxAuthFailuresPerHost` (10) logins within `authFailureWindow` (60 s) is refused
+  without a password check until those failures age out — that protects the event
+  loop, not the account: it forgets on restart, and many addresses each get their
+  own budget. Rejected logins are logged at `warning`, with the username, the
+  remote address and the client ID, and refused-while-throttled attempts on a line
+  of their own ("Login throttled …"). A fail2ban filter can match the failures:
 
   ```
   failregex = ^\[.*\] warning: Authentication failed for .* from <HOST>:\d+
   ```
 
-  Usernames and client IDs are attacker-controlled, so control characters in them
-  are escaped before they reach the log and cannot forge entries.
+  Usernames, client IDs and topics are attacker-controlled, and MQTT allows
+  newlines in all three. Every such value is escaped before it is logged, and the
+  CLI's logger escapes control characters in each finished line as well, so no
+  client can produce a line of its own — say, a forged "Authentication failed" for
+  an address it wants banned. A client must also send CONNECT first: anything else
+  is refused on its first byte, before it reaches a decoder. If you embed the broker
+  with your own PSR-3 logger, it receives already-escaped values.
 
   A refused *client ID* is logged too, but on a separate line that the filter
   deliberately does not match — and should not. It means the password was correct
@@ -332,9 +371,9 @@ It is marked experimental at the top of this README, and these gaps are real:
   debugging it, within seconds of a rollout.
 - **`maxConnections` is global, not per-client**, and connections are admitted
   before authentication.
-- **Most limits are unreachable from the CLI.** Only 8 of `Configuration`'s 22
-  options have flags — `host`, `port`, `--state-file` and the five `--tls-*`
-  ones. The other 14,
+- **Most limits are unreachable from the CLI.** Only 9 of `Configuration`'s 31
+  options have flags — `host`, `port`, `--state-file` and the six `--tls-*`
+  ones. The other 22,
   including every `max*` limit and `connectTimeout`, require constructing
   `Configuration` in your own entrypoint; see the
   [configuration reference](docs/embedding.md#configuration-reference). Until then,
@@ -384,9 +423,9 @@ publishing client's connection, and listeners run synchronously inside the event
 
 ## Testing with MQTT Clients
 
-Once the broker is running, connect with any MQTT client. These commands assume the
-default listener — `bin/mqtt-broker` with no flags, plaintext on 1883, accepting
-anyone:
+Once the broker is running, connect with any MQTT client. These commands assume a
+development listener — `bin/mqtt-broker --allow-anonymous`, plaintext on 1883,
+accepting anyone:
 
 ```bash
 # Subscribe (using mosquitto_sub)
@@ -433,7 +472,7 @@ The project includes a [DDEV](https://ddev.com/) configuration for local develop
 ```bash
 # Start the environment, then the broker
 ddev start
-ddev exec "cd /var/www/html && nohup php bin/mqtt-broker > /tmp/broker.log 2>&1 &"
+ddev exec "cd /var/www/html && nohup php bin/mqtt-broker --allow-anonymous > /tmp/broker.log 2>&1 &"
 
 # Connect from the host (11883 on the host, 1883 inside the container)
 mosquitto_sub -h localhost -p 11883 -t '#'

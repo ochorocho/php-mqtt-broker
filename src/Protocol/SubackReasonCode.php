@@ -18,4 +18,5 @@ enum SubackReasonCode: int
     case NoSubscriptionExisted = 0x11;
     case UnspecifiedError = 0x80;
     case NotAuthorized = 0x87;
+    case QuotaExceeded = 0x97;
 }

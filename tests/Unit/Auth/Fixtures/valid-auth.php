@@ -10,12 +10,12 @@ return new class implements AuthenticatorInterface {
         return $username === 'fixture';
     }
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool
     {
         return true;
     }
 
-    public function canPublish(string $clientId, string $topicName): bool
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool
     {
         return true;
     }

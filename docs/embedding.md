@@ -44,6 +44,21 @@ $broker = new Broker(
 $broker->start(); // binds, then runs $loop — your timer runs too
 ```
 
+`ReactPhpServer` takes three more arguments, which matter for a TLS listener:
+
+```php
+new ReactPhpServer(
+    $loop,
+    handshakeTimeout: 10.0,       // seconds a TLS client has to finish its handshake
+    maxPendingHandshakes: 1000,   // TLS sockets allowed mid-handshake at once
+    logger: $logger,              // handshake failures and timeouts, at debug
+);
+```
+
+`Broker` only sees a TLS connection once its handshake is done, so its own CONNECT
+deadline and `maxConnections` do not cover a socket that connects and sends nothing;
+these two do. `bin/mqtt-broker` sets `handshakeTimeout` to `connectTimeout`.
+
 Two things to know:
 
 - **You must still call `start()`.** It is what binds the listener and installs the
@@ -96,8 +111,7 @@ will topics to tolerate it.
 
 ## The authenticator contract
 
-`AuthenticatorInterface` has four methods, and the difference between them is not
-obvious from the signatures:
+`AuthenticatorInterface` has four methods:
 
 ```php
 interface AuthenticatorInterface
@@ -106,28 +120,30 @@ interface AuthenticatorInterface
 
     public function canUseClientId(string $clientId, ?string $username): bool;
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool;
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool;
 
-    public function canPublish(string $clientId, string $topicName): bool;
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool;
 }
 ```
 
-**Only the first two receive the username.** `canSubscribe()` and `canPublish()` get a
-client ID and a topic, nothing else. So per-user topic rules are impossible unless you
-record who a client ID belongs to while you still know — during `authenticate()`.
-
-Getting this wrong is quiet rather than loud: you write an authorizer that compiles,
-passes a smoke test with one client, and silently authorizes the wrong things once two
-accounts are connected.
+**Every method receives the username** the connection authenticated with (null for an
+anonymous one). Decide per account from that argument. Do not keep a map of "which
+account is this client ID" filled in during `authenticate()`: that runs *before* the
+broker checks `canUseClientId()`, so an account with valid credentials could
+overwrite another device's entry with an attempt that is then refused. Earlier
+versions passed no username to `canSubscribe()`/`canPublish()` and this page
+recommended exactly that map; implementations written against it need the extra
+parameter, and can drop the map.
 
 ### When each method is called
 
 | Method | Called |
 |---|---|
-| `authenticate()` | Once per connection, on CONNECT |
-| `canUseClientId()` | Once per connection, immediately after `authenticate()` succeeds |
+| `authenticate()` | Once per connection, on CONNECT — unless the remote host is over its failed-login budget (`maxAuthFailuresPerHost`), in which case it is refused without being asked |
+| `canUseClientId()` | Once per connection, immediately after `authenticate()` succeeds. Not for an ID the broker assigned itself (the client sent an empty one): those are random and belong to no account |
 | `canSubscribe()` | Per topic filter in every SUBSCRIBE — **and again for every restored subscription when a client reconnects to a persistent session** |
 | `canPublish()` | Per inbound PUBLISH, plus once on the will topic at connect, plus again when a will is actually published |
+| `canReceive()` | Only if the authenticator implements `DeliveryAuthorizerInterface`: per message, per subscriber, just before it is sent |
 
 The session-restore case surprises people. A client reconnecting with
 `cleanSession: false` re-authorizes each of its stored subscriptions, so an
@@ -138,6 +154,37 @@ not just on the original SUBSCRIBE. Cache accordingly.
 client is told immediately rather than discovering at disconnect that its will was
 dropped, and once at publication, because authorization may have been revoked while
 the client was connected.
+
+`authenticate()` runs on the broker's only thread. A password hash is slow on purpose
+(bcrypt at PHP's default cost is about 0.2 s), and every client waits while it runs.
+The broker throttles hosts that keep failing, but a check that succeeds is paid in
+full each time: remember a verified password — as a keyed hash, never the password —
+the way `PasswordFileAuthenticator` does.
+
+### Vetoing individual deliveries
+
+`canSubscribe()` is asked once per filter. Grant `sensors/#` and every topic beneath it
+is delivered for as long as the subscription lasts, so an authorizer that only checks
+filters has to reason about everything a wildcard could ever match.
+
+An authenticator that also implements `DeliveryAuthorizerInterface` is asked instead
+about each message, for each subscriber it is about to go to:
+
+```php
+interface DeliveryAuthorizerInterface
+{
+    public function canReceive(string $clientId, ?string $username, string $topicName): bool;
+}
+```
+
+It is consulted for live deliveries, for retained messages on subscribe, and for queued
+messages when they finally go out — so access revoked while a client was offline
+holds when it returns. A denied message is dropped for that subscriber only; the
+publisher is told nothing. It fails closed like every other check.
+
+It runs once per message per subscriber, on the broker's only thread. Answer it from
+memory — say, a rule set loaded in `authenticate()` per username — rather than from a
+database call.
 
 ### Failures deny rather than crash
 
@@ -151,17 +198,13 @@ it yourself; the broker logs the exception but answers the client the same way.
 
 ### A per-user ACL authenticator
 
-This is the shape to copy. Note `$identities` — without it, `canPublish()` has no idea
-which account `$clientId` belongs to:
+This is the shape to copy:
 
 ```php
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
 
 final class TopicScopedAuthenticator implements AuthenticatorInterface
 {
-    /** @var array<string, string> clientId => username, recorded at authenticate() */
-    private array $identities = [];
-
     public function __construct(private readonly \PDO $pdo)
     {
     }
@@ -176,14 +219,7 @@ final class TopicScopedAuthenticator implements AuthenticatorInterface
         $statement->execute([$username]);
         $hash = $statement->fetchColumn();
 
-        if (!is_string($hash) || !password_verify($password, $hash)) {
-            return false;
-        }
-
-        // The only place the username is available. Everything below depends on it.
-        $this->identities[$clientId] = $username;
-
-        return true;
+        return is_string($hash) && password_verify($password, $hash);
     }
 
     public function canUseClientId(string $clientId, ?string $username): bool
@@ -194,39 +230,43 @@ final class TopicScopedAuthenticator implements AuthenticatorInterface
             && ($clientId === $username || str_starts_with($clientId, $username . '-'));
     }
 
-    public function canSubscribe(string $clientId, string $topicFilter): bool
+    public function canSubscribe(string $clientId, ?string $username, string $topicFilter): bool
     {
-        return $this->ownsPrefix($clientId, $topicFilter);
+        return $this->ownsPrefix($username, $topicFilter);
     }
 
-    public function canPublish(string $clientId, string $topicName): bool
+    public function canPublish(string $clientId, ?string $username, string $topicName): bool
     {
-        return $this->ownsPrefix($clientId, $topicName);
+        return $this->ownsPrefix($username, $topicName);
     }
 
-    private function ownsPrefix(string $clientId, string $topic): bool
+    private function ownsPrefix(?string $username, string $topic): bool
     {
-        $username = $this->identities[$clientId] ?? null;
+        // Fail closed for anonymous clients, and for usernames that are topic syntax:
+        // a user called "+" would otherwise own "+/#", which is everyone's topics.
+        if ($username === null || preg_match('/[\/+#]/', $username) === 1) {
+            return false;
+        }
 
-        // Fail closed: an unknown client ID means we never saw it authenticate.
-        return $username !== null && str_starts_with($topic, $username . '/');
+        return str_starts_with($topic, $username . '/');
     }
 }
 ```
 
-Two things this deliberately does not do. It never prunes `$identities`, which is fine
-for a fixed device roster and a leak for thousands of rotating client IDs — clear the
-entry when a client disconnects if that describes you. And `ownsPrefix()` treats a
-subscription filter as a plain string: `str_starts_with` correctly rejects `#` and
-`+/…`, because neither begins with `alice/`. Do not reach for the broker's internal
-topic matcher here; it answers "does this filter match this topic", which is a
-different question from "may this account use this filter".
+Three things this deliberately does not do. `ownsPrefix()` treats a subscription
+filter as a plain string: `str_starts_with` correctly rejects `#`, `+/…` and
+`$share/…`, because none of them begins with `alice/`. Do not reach for the broker's
+internal topic matcher here; it answers "does this filter match this topic", which is
+a different question from "may this account use this filter". `canUseClientId()` has
+the same prefix collision `PasswordFileAuthenticator` guards against — if `alice` and
+`alice-bob` can both be accounts, refuse a client ID that a longer username owns. And
+it does not cache successful logins, which a busy deployment should.
 
 ### The default authenticator
 
 Without an `authenticator:` argument the broker uses `AllowAllAuthenticator`, which
 permits everything — with one exception: it refuses subscriptions to
-`test/nosubscribe`, an affordance for the MQTT conformance suite. Harmless, but
+`test/nosubscribe` (shared ones included), an affordance for the MQTT conformance suite. Harmless, but
 surprising if you ever wonder why that one topic behaves differently.
 
 ## Error handling
@@ -355,7 +395,7 @@ interface ServerInterface
 
 interface ConnectionStream
 {
-    public function write(string $data): void;
+    public function write(string $data): bool;   // false = backpressure; see below
 
     public function close(): void;
 
@@ -367,21 +407,27 @@ interface ConnectionStream
 }
 ```
 
-`tests/Unit/Handler/RecordingStream.php` is a complete worked example in 41 lines: it
+`tests/Unit/Handler/RecordingStream.php` is a complete worked example in 43 lines: it
 collects writes into an array, records whether it was closed, and leaves `onData()` and
 `onClose()` as empty stubs — a double driven by the test rather than by a socket has
 nothing to register. Assertions then read what the broker wrote, decoded back into
 packets.
+
+To drive a whole `Broker` instead, `tests/Unit/Broker/` has a `FakeServer`, a
+`ScriptedStream` that keeps its handlers so a test can `push()` raw bytes, and a
+`FakeLoop` whose `run()` returns at once and whose timers fire only when the test
+calls `advance()` — so `start()` can be called in a test and timeouts are
+deterministic.
 
 The same shape gives you an alternative transport. Implement both interfaces over
 WebSocket, a Unix socket, or an in-memory pipe, and the broker is unchanged.
 
 ## Configuration reference
 
-`Configuration` is a value object: 21 constructor parameters, all with defaults, all
-readonly. **Only seven are reachable from the CLI** — `host`, `port` and the five
-`--tls-*` options. The other fourteen can only be set by constructing it yourself,
-which is the main reason to embed the broker rather than run the binary.
+`Configuration` is a value object: 31 constructor parameters, all with defaults, all
+readonly. **Only nine are reachable from the CLI** — `host`, `port`, `--state-file`
+and the six `--tls-*` options. The others can only be set by constructing it
+yourself, which is the main reason to embed the broker rather than run the binary.
 
 ```php
 $config = new Configuration(
@@ -401,26 +447,34 @@ $config = new Configuration(
 | `port` | `int` | `1883` | Bind port. Use 8883 by convention when TLS is on. |
 | `maxConnections` | `int` | `10000` | Concurrent connections accepted; beyond this new sockets are closed immediately. Global, not per-IP. |
 | `connectTimeout` | `float` | `10.0` | Seconds a connection may stay open before sending CONNECT. Bounds what an unauthenticated peer can hold. |
-| `maxPacketSize` | `int` | `1048576` | Largest accepted inbound packet, in bytes. Also caps a connection's receive buffer, so a client cannot stream unbounded data without completing a packet. |
+| `maxPacketSize` | `int` | `1048576` | Largest accepted inbound packet, in bytes, once a client has connected. Also caps what a connection may leave buffered without completing a packet. |
+| `maxConnectPacketSize` | `int` | `65536` | Largest packet accepted *before* CONNECT succeeds. An unauthenticated peer has proven nothing, so it does not get `maxPacketSize`; at the old limit ten thousand of them could hold ten gigabytes. Raise it if clients send wills larger than this. |
+| `maxOutboundBufferBytes` | `int` | `8388608` | Backlog tolerated for a client that has stopped reading. Past it the client is disconnected and a `warning` is logged. Without it, a subscriber that never reads makes the broker keep every message routed to it. |
 | `maxClientIdLength` | `int` | `256` | Client identifier length in bytes. |
+| `maxAuthFailuresPerHost` | `int` | `10` | Failed logins tolerated from one remote address within `authFailureWindow`. Beyond it, CONNECT is refused (`0x05`, or `0x9F` Connection rate exceeded in 5.0) without asking the authenticator, and logged as "Login throttled". Successful logins never count. `0` disables. |
+| `authFailureWindow` | `float` | `60.0` | Seconds a failed login counts against its host. |
 
 ### Sessions and keep-alive
 
 | Parameter | Type | Default | Purpose |
 |---|---|---|---|
 | `minKeepAlive` | `int` | `300` | Lower bound applied when a client requests keep-alive 0, which would otherwise never be reaped. |
-| `maxSessions` | `int` | `10000` | Persistent sessions retained; the oldest idle session is evicted beyond this. |
+| `maxSessions` | `int` | `10000` | Sessions held, live and offline; beyond this an offline one is evicted — the connecting account's own oldest first, then the oldest overall. |
+| `maxSessionsPerUsername` | `int` | `1000` | Sessions one account may hold, live and offline. Past it the account's own oldest offline session is evicted; with every one live, the CONNECT is refused (`0x97` Quota exceeded in 5.0, `0x03` Server unavailable in 3.1.1). Without it, one account churning client IDs could push every other account's offline sessions and queued messages out. Sessions without a username count only against `maxSessions`. `0` disables. |
 | `maxSessionExpiry` | `int` | `86400` | Ceiling for a session's expiry interval, in seconds. MQTT 3.1.1 sessions have no expiry of their own. |
 | `maxPendingMessagesPerSession` | `int` | `1000` | Offline queue depth per session. When full the oldest message is dropped and logged at `warning`. |
+| `maxInflightMessages` | `int` | `64` | QoS 1 and 2 messages sent to one client and not yet acknowledged. MQTT 3.1.1 has no Receive Maximum, so this is the whole limit there; a 5.0 client's own Receive Maximum applies when it is lower. Further messages wait in the session queue. |
 
 ### Subscriptions and retained messages
 
 | Parameter | Type | Default | Purpose |
 |---|---|---|---|
 | `maxSubscriptionsPerClient` | `int` | `1000` | Active subscriptions per client. |
-| `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic or filter. |
+| `maxFiltersPerSubscribe` | `int` | `128` | Topic filters acted on in one SUBSCRIBE; the rest are refused (`0x80`, or `0x97` Quota exceeded in 5.0). A filter named twice in one packet has its retained messages sent once. |
+| `maxTopicLevels` | `int` | `32` | Levels (`/`-separated) in a topic name or filter — subscriptions, published topics, will topics and restored retained topics alike. A shared filter is counted behind its `$share/<group>/` prefix. |
+| `maxTopicLength` | `int` | `4096` | Bytes in a topic name or filter, wherever one enters the broker. MQTT itself allows 65535, at which one client's thousand subscriptions are 64 MiB of routing table. A PUBLISH over either limit is refused (`0x90` Topic Name invalid in 5.0, acknowledged and dropped in 3.1.1); a filter gets `0x80`; a will refuses the CONNECT. |
 | `maxRetainedMessages` | `int` | `10000` | Distinct retained topics. |
-| `maxRetainedBytes` | `int` | `67108864` | Total retained payload bytes — the real memory bound, since everything is in-process. |
+| `maxRetainedBytes` | `int` | `67108864` | Total retained bytes, counting each message's topic name, payload and properties — the real memory bound, since everything is in-process. Only properties that travel with a message (payload format, content type, response topic, correlation data, user properties, message expiry) are retained; a topic alias or authentication data is dropped. |
 | `retainedStatePath` | `?string` | `null` | File the retained messages are kept in across restarts (`--state-file` on the CLI). Written a few seconds after they change and on `stop()`, read back in `start()`; its directory must be writable or `start()` refuses. Null keeps them in memory only. |
 
 ### TLS
@@ -430,10 +484,11 @@ $config = new Configuration(
 | `tlsCertPath` | `?string` | `null` | Server certificate. Setting it is what enables TLS. |
 | `tlsKeyPath` | `?string` | `null` | Private key. |
 | `tlsKeyPassphrase` | `?string` | `null` | Passphrase for an encrypted private key. |
-| `tlsRequireClientCert` | `bool` | `false` | Require and verify a client certificate (mutual TLS). Needs `tlsClientCaPath`. |
+| `tlsRequireClientCert` | `bool` | `false` | Require and verify a client certificate (mutual TLS). Needs `tlsClientCaPath`, and a TLS listener: `start()` refuses it without `tlsCertPath`, where it would enforce nothing. |
 | `tlsClientCaPath` | `?string` | `null` | CA bundle used to verify client certificates. |
 | `tlsCiphers` | `?string` | `null` | OpenSSL cipher list. Null uses the PHP default. |
 | `tlsMinVersion` | `int` | `STREAM_CRYPTO_METHOD_TLSv1_2_SERVER` | Minimum protocol, as an OpenSSL crypto-method constant. Defaults to TLS 1.2 or better; PHP's own default would still negotiate TLS 1.0 on some builds. |
+| `tlsIdentityAsUsername` | `bool` | `false` | Use the common name of the verified client certificate as the username, ignoring the one in CONNECT; a connection without one is refused. Needs `tlsRequireClientCert`. Pair it with `CertificateIdentityAuthenticator` for certificate-only authentication (client IDs bound to the name), or with your own authenticator, which then receives the certificate's name. `start()` refuses `CertificateIdentityAuthenticator` without it. |
 
 ### Not configurable
 
@@ -441,3 +496,11 @@ Three server-side values are compile-time constants, despite appearing in the fe
 list as though they were tunable: the server's Receive Maximum is 20, its Topic Alias
 Maximum is 10, and the Server Keep Alive it advertises to MQTT 5.0 clients is 60
 seconds.
+
+### Custom transports
+
+`ConnectionStream::write()` returns `bool`: `false` means the transport is buffering
+past its soft limit because the peer is not keeping up. The data must still be
+queued. The broker counts the bytes written while it keeps answering `false` and
+disconnects past `maxOutboundBufferBytes`. A transport that cannot tell should return
+`true`.

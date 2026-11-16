@@ -21,9 +21,12 @@ require $autoload;
 
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
 use PhpMqtt\Broker\Auth\AuthenticatorLoader;
+use PhpMqtt\Broker\Auth\CertificateIdentityAuthenticator;
 use PhpMqtt\Broker\Auth\PasswordFileAuthenticator;
 use PhpMqtt\Broker\Broker;
 use PhpMqtt\Broker\Configuration;
+use PhpMqtt\Broker\Log\StreamLogger;
+use PhpMqtt\Broker\Server\ReactPhpServer;
 
 $options = getopt('', [
     'host:',
@@ -31,11 +34,14 @@ $options = getopt('', [
     'tls-cert:',
     'tls-key:',
     'tls-passphrase:',
+    'tls-passphrase-file:',
     'tls-client-ca:',
     'tls-require-client-cert',
+    'tls-identity-as-username',
     'password-file:',
     'auth:',
     'allow-any-client-id',
+    'allow-anonymous',
     'state-file:',
     'help',
 ]);
@@ -51,13 +57,23 @@ if ($flag('help')) {
       --host=ADDR              Bind address (default 0.0.0.0)
       --port=PORT              Bind port (default 1883, or 8883 with --tls-cert)
 
-    Authentication (optional; without either flag the broker accepts anyone):
+    Authentication (one of these is required):
       --password-file=PATH     Authenticate against a file of hashed credentials.
                                Write it with bin/mqtt-passwd.
       --auth=PATH              Load a PHP file returning an AuthenticatorInterface,
                                for database, LDAP or per-topic rules. The file runs
                                with the broker's privileges: it must be owned by the
                                operator and not writable by the broker user.
+      --tls-identity-as-username
+                               Identify clients by their TLS certificate: its common
+                               name is the username, whatever CONNECT says. Needs
+                               --tls-require-client-cert. On its own it is the whole
+                               authentication, with client IDs bound to the name as
+                               for a password file; with --password-file or --auth,
+                               those check the certificate's name instead.
+      --allow-anonymous        Accept every client without credentials. Anyone who
+                               can reach the port may then read every topic and take
+                               over any client ID. For development and test rigs.
       --allow-any-client-id    With --password-file, stop requiring a client ID to
                                belong to the account that authenticated. Only for
                                clients whose ID is unrelated to their username.
@@ -71,7 +87,11 @@ if ($flag('help')) {
     TLS:
       --tls-cert=PATH          Server certificate (enables TLS)
       --tls-key=PATH           Private key
-      --tls-passphrase=SECRET  Passphrase for an encrypted key
+      --tls-passphrase-file=PATH
+                               Read the passphrase for an encrypted key from the
+                               first line of a file (with systemd: LoadCredential=)
+      --tls-passphrase=SECRET  The same on the command line, where every user on the
+                               host can read it from the process list. Avoid.
       --tls-require-client-cert  Require and verify a client certificate
       --tls-client-ca=PATH     CA bundle used to verify client certificates
 
@@ -84,6 +104,43 @@ if ($flag('help')) {
     exit(0);
 }
 
+// A passphrase on the command line is in the process list, the shell history and the
+// unit file. A file - systemd's LoadCredential= puts one where only the service reads
+// it - is not.
+$tlsPassphrase = $str('tls-passphrase');
+$tlsPassphraseFile = $str('tls-passphrase-file');
+
+if ($tlsPassphrase !== null && $tlsPassphraseFile !== null) {
+    fwrite(STDERR, "--tls-passphrase cannot be combined with --tls-passphrase-file\n");
+    exit(1);
+}
+
+if ($tlsPassphrase !== null) {
+    fwrite(STDERR, "Warning: --tls-passphrase is visible to every user in the process list; "
+        . "use --tls-passphrase-file instead\n");
+}
+
+if ($tlsPassphraseFile !== null) {
+    $contents = is_file($tlsPassphraseFile) && is_readable($tlsPassphraseFile)
+        ? file_get_contents($tlsPassphraseFile)
+        : false;
+    if ($contents === false) {
+        fwrite(STDERR, sprintf("Failed to start: TLS passphrase file is not readable: %s\n", $tlsPassphraseFile));
+        exit(1);
+    }
+
+    $tlsPassphrase = rtrim(explode("\n", $contents, 2)[0], "\r");
+    if ($tlsPassphrase === '') {
+        fwrite(STDERR, sprintf("Failed to start: TLS passphrase file is empty: %s\n", $tlsPassphraseFile));
+        exit(1);
+    }
+
+    $mode = fileperms($tlsPassphraseFile);
+    if ($mode !== false && ($mode & 0o077) !== 0) {
+        fwrite(STDERR, sprintf("Warning: %s is readable by other users (mode %04o)\n", $tlsPassphraseFile, $mode & 0o7777));
+    }
+}
+
 $passwordFile = $str('password-file');
 $authFile = $str('auth');
 
@@ -91,6 +148,22 @@ $authFile = $str('auth');
 // enforced when a custom authenticator has replaced it.
 if ($passwordFile !== null && $authFile !== null) {
     fwrite(STDERR, "--password-file and --auth are mutually exclusive\n");
+    exit(1);
+}
+
+// An unconfigured broker used to accept anyone, on every interface by default. That
+// has to be a decision, not an omission.
+$certificateIdentity = $flag('tls-identity-as-username');
+
+if ($passwordFile === null && $authFile === null && !$certificateIdentity && !$flag('allow-anonymous')) {
+    fwrite(STDERR, "No authentication configured. Pass --password-file, --auth or --tls-identity-as-username,\n"
+        . "or --allow-anonymous to accept every client without credentials (development only).\n"
+        . "See --help.\n");
+    exit(1);
+}
+
+if ($flag('allow-anonymous') && ($passwordFile !== null || $authFile !== null || $certificateIdentity)) {
+    fwrite(STDERR, "--allow-anonymous cannot be combined with --password-file, --auth or --tls-identity-as-username\n");
     exit(1);
 }
 
@@ -113,25 +186,16 @@ $config = new Configuration(
     port: (int) ($options['port'] ?? ($tlsCert !== null ? 8883 : 1883)),
     tlsCertPath: $tlsCert,
     tlsKeyPath: $str('tls-key'),
-    tlsKeyPassphrase: $str('tls-passphrase'),
+    tlsKeyPassphrase: $tlsPassphrase,
     tlsRequireClientCert: $flag('tls-require-client-cert'),
+    tlsIdentityAsUsername: $certificateIdentity,
     tlsClientCaPath: $str('tls-client-ca'),
     retainedStatePath: $str('state-file'),
 );
 
-$logger = new class extends \Psr\Log\AbstractLogger {
-    public function log($level, \Stringable|string $message, array $context = []): void
-    {
-        $msg = str_replace(
-            array_map(fn($k) => '{' . $k . '}', array_keys($context)),
-            array_map(fn($v) => $v instanceof \Throwable ? $v->getMessage() . "\n" . $v->getTraceAsString() : (string) $v, array_values($context)),
-            (string) $message,
-        );
-        // Full date and offset, so lines stay orderable across days and are usable as
-        // input to a log-based blocker rather than only readable by a human.
-        fwrite(STDERR, sprintf("[%s] %s: %s\n", date('Y-m-d H:i:sP'), $level, $msg));
-    }
-};
+// Escapes every value it writes: its lines are what the fail2ban filter matches,
+// so nothing a client sends may produce a line of its own.
+$logger = new StreamLogger(STDERR);
 
 try {
     // Build the authenticator and check the TLS material before announcing a
@@ -144,6 +208,8 @@ try {
         );
     } elseif ($authFile !== null) {
         $authenticator = AuthenticatorLoader::load($authFile);
+    } elseif ($certificateIdentity) {
+        $authenticator = new CertificateIdentityAuthenticator();
     }
 
     $config->validateTls();
@@ -156,7 +222,10 @@ assert($authenticator === null || $authenticator instanceof AuthenticatorInterfa
 
 // Passing null keeps Broker's own default, so one place decides that an
 // unconfigured broker accepts anyone.
-$broker = new Broker(config: $config, authenticator: $authenticator, logger: $logger);
+// The TLS handshake gets the same deadline as CONNECT: until both are done, a peer
+// has proven nothing and must not hold a socket open.
+$server = new ReactPhpServer(handshakeTimeout: $config->connectTimeout, logger: $logger);
+$broker = new Broker(config: $config, server: $server, authenticator: $authenticator, logger: $logger);
 
 if (function_exists('pcntl_async_signals')) {
     pcntl_async_signals(true);
@@ -172,7 +241,8 @@ echo sprintf(
     match (true) {
         $passwordFile !== null => 'password file: ' . $passwordFile,
         $authFile !== null => 'authenticator: ' . $authFile,
-        default => 'no authentication',
+        $certificateIdentity => 'client certificate identities',
+        default => 'NO AUTHENTICATION, --allow-anonymous',
     },
 );
 

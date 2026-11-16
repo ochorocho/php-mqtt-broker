@@ -26,13 +26,27 @@ final class TopicMatcher
             $node = &$node['children'][$level];
         }
 
-        $node['subscriptions'][$sub->clientId] = $sub;
+        $node['subscriptions'][self::key($sub->clientId, $sub->topicFilter)] = $sub;
     }
 
-    public function unsubscribe(string $topicFilter, string $clientId): void
+    /**
+     * @param string $topicFilter The filter as matched: without any `$share/<group>/`.
+     * @param ?string $fullFilter The filter as subscribed, when it differs (shared).
+     */
+    public function unsubscribe(string $topicFilter, string $clientId, ?string $fullFilter = null): void
     {
         $levels = explode('/', $topicFilter);
-        $this->unsubscribeRecursive($this->root, $levels, 0, $clientId);
+        $this->unsubscribeRecursive($this->root, $levels, 0, self::key($clientId, $fullFilter ?? $topicFilter));
+    }
+
+    /**
+     * One entry per client *and* filter. Shared filters are stored under their stripped
+     * form, so a client's `a/b`, `$share/g/a/b` and `$share/h/a/b` share a node; keyed by
+     * client ID alone they overwrote each other.
+     */
+    private static function key(string $clientId, string $fullFilter): string
+    {
+        return $clientId . "\0" . $fullFilter;
     }
 
     /**
@@ -45,10 +59,10 @@ final class TopicMatcher
      * @param string[] $levels
      * @return bool True when this node is now empty and its parent may drop it.
      */
-    private function unsubscribeRecursive(array &$node, array $levels, int $depth, string $clientId): bool
+    private function unsubscribeRecursive(array &$node, array $levels, int $depth, string $key): bool
     {
         if ($depth === count($levels)) {
-            unset($node['subscriptions'][$clientId]);
+            unset($node['subscriptions'][$key]);
 
             return $node['subscriptions'] === [] && $node['children'] === [];
         }
@@ -58,7 +72,7 @@ final class TopicMatcher
             return $node['subscriptions'] === [] && $node['children'] === [];
         }
 
-        if ($this->unsubscribeRecursive($node['children'][$level], $levels, $depth + 1, $clientId)) {
+        if ($this->unsubscribeRecursive($node['children'][$level], $levels, $depth + 1, $key)) {
             unset($node['children'][$level]);
         }
 

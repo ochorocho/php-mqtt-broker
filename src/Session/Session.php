@@ -21,6 +21,8 @@ final class Session
         public int $sessionExpiryInterval = 0,
         public float $disconnectedAt = 0.0,
         public ProtocolVersion $protocolVersion = ProtocolVersion::V311,
+        /** The account the session belongs to; set by SessionManager::claim(). */
+        public ?string $username = null,
     ) {
     }
 }

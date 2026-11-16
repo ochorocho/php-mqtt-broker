@@ -4,23 +4,62 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Server;
 
+use React\EventLoop\LoopInterface;
+use React\EventLoop\TimerInterface;
+use React\Socket\Connection as ReactSocketConnection;
 use React\Socket\ConnectionInterface as ReactConnection;
 
-final class ReactPhpConnectionStream implements ConnectionStream
+final class ReactPhpConnectionStream implements ConnectionStream, PeerCertificateStream
 {
+    /** Seconds a graceful close may wait for the write buffer to flush. */
+    public const float FORCE_CLOSE_AFTER = 5.0;
+
+    private bool $closing = false;
+    private bool $closed = false;
+    private ?TimerInterface $forceCloseTimer = null;
+
     public function __construct(
         private readonly ReactConnection $connection,
+        private readonly LoopInterface $loop,
     ) {
+        $this->connection->on('close', function (): void {
+            $this->closed = true;
+            if ($this->forceCloseTimer !== null) {
+                $this->loop->cancelTimer($this->forceCloseTimer);
+                $this->forceCloseTimer = null;
+            }
+        });
     }
 
-    public function write(string $data): void
+    public function write(string $data): bool
     {
-        $this->connection->write($data);
+        return $this->connection->write($data);
     }
 
+    /**
+     * End the connection, flushing what is buffered, and shut it hard if that does not
+     * finish in time.
+     *
+     * end() alone waits for the buffer to drain, which a peer that has stopped reading
+     * never allows: the socket, its buffer and its connection slot stayed for the life
+     * of the process.
+     */
     public function close(): void
     {
+        if ($this->closing) {
+            return;
+        }
+        $this->closing = true;
+
         $this->connection->end();
+
+        // end() closes at once when nothing is buffered; otherwise give it a deadline.
+        if (!$this->closed) {
+            $this->forceCloseTimer = $this->loop->addTimer(self::FORCE_CLOSE_AFTER, function (): void {
+                $this->forceCloseTimer = null;
+                $this->connection->close();
+            });
+        }
     }
 
     public function onData(callable $handler): void
@@ -31,6 +70,27 @@ final class ReactPhpConnectionStream implements ConnectionStream
     public function onClose(callable $handler): void
     {
         $this->connection->on('close', $handler);
+    }
+
+    /**
+     * Read from the stream's TLS context: with capture_peer_cert set, PHP leaves the
+     * certificate the handshake verified there.
+     */
+    public function getPeerCertificateCommonName(): ?string
+    {
+        if (!$this->connection instanceof ReactSocketConnection || !is_resource($this->connection->stream)) {
+            return null;
+        }
+
+        $certificate = stream_context_get_options($this->connection->stream)['ssl']['peer_certificate'] ?? null;
+        if (!$certificate instanceof \OpenSSLCertificate) {
+            return null;
+        }
+
+        // Several CNs come back as a list; an identity has to be exactly one.
+        $commonName = openssl_x509_parse($certificate)['subject']['CN'] ?? null;
+
+        return is_string($commonName) && $commonName !== '' ? $commonName : null;
     }
 
     public function getRemoteAddress(): string

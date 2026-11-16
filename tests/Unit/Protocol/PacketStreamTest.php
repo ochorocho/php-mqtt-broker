@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Tests\Unit\Protocol;
 
 use PhpMqtt\Broker\Exception\MalformedPacketException;
+use PhpMqtt\Broker\Protocol\DataType;
 use PhpMqtt\Broker\Protocol\PacketStream;
 use PHPUnit\Framework\TestCase;
 
@@ -163,5 +164,33 @@ final class PacketStreamTest extends TestCase
         $stream->clear();
         self::assertSame(0, $stream->getBufferLength());
         self::assertFalse($stream->hasCompletePacket());
+    }
+
+    public function testAcceptsMaximumSizePacketFollowedByMoreData(): void
+    {
+        $stream = new PacketStream(maxPacketSize: 1024);
+
+        // Exactly 1024 bytes: type byte, two-byte remaining length, 1021 bytes of body.
+        $packet = "\x30" . DataType::encodeVariableByteInteger(1021) . str_repeat('x', 1021);
+        self::assertSame(1024, strlen($packet));
+
+        // The tail of a full-size packet arriving in the same read as the next packet
+        // is ordinary traffic. Counting both against the limit used to reject it.
+        $stream->append(substr($packet, 0, -1));
+        self::assertFalse($stream->hasCompletePacket());
+        $stream->append(substr($packet, -1) . "\xC0\x00");
+
+        self::assertSame($packet, $stream->nextPacket());
+        self::assertSame("\xC0\x00", $stream->nextPacket());
+        self::assertSame(0, $stream->getBufferLength());
+    }
+
+    public function testPeekPacketTypeReadsTheTypeNibble(): void
+    {
+        $stream = new PacketStream();
+        self::assertNull($stream->peekPacketType());
+
+        $stream->append("\x32");
+        self::assertSame(3, $stream->peekPacketType());
     }
 }

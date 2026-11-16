@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpMqtt\Broker\Message;
 
 use PhpMqtt\Broker\Protocol\Packet\PublishPacket;
+use PhpMqtt\Broker\Protocol\Property\PropertyCodec;
 use PhpMqtt\Broker\Protocol\TopicFilter;
 
 final class RetainedMessageStore
@@ -14,17 +15,30 @@ final class RetainedMessageStore
 
     private int $totalBytes = 0;
 
+    /** @var array<string, int> topic => bytes it is counted as */
+    private array $sizes = [];
+
     /** Whether anything changed since the store was last written out. */
     private bool $dirty = false;
 
     /**
+     * The retained topics as a tree of levels, so a lookup walks only the branches a
+     * filter can reach. Scanning every topic per filter made one small SUBSCRIBE of
+     * 128 filters cost a quarter of a second against 10k retained messages.
+     */
+    private readonly TopicNode $index;
+
+    /**
      * Retained messages persist until overwritten, so without bounds any client can
      * pin unlimited attacker-chosen data in memory for the life of the process.
+     *
+     * @param int $maxBytes Topic, payload and property bytes across every message.
      */
     public function __construct(
         private readonly int $maxMessages = 10000,
         private readonly int $maxBytes = 67108864,
     ) {
+        $this->index = new TopicNode();
     }
 
     /**
@@ -32,9 +46,10 @@ final class RetainedMessageStore
      */
     public function store(string $topic, PublishPacket $packet): bool
     {
-        $size = strlen($packet->payload);
+        $packet = self::retainable($packet);
+        $size = self::sizeOf($topic, $packet);
         $existing = $this->messages[$topic] ?? null;
-        $delta = $size - ($existing !== null ? strlen($existing->payload) : 0);
+        $delta = $size - ($this->sizes[$topic] ?? 0);
 
         if ($existing === null && count($this->messages) >= $this->maxMessages) {
             return false;
@@ -44,7 +59,12 @@ final class RetainedMessageStore
             return false;
         }
 
+        if ($existing === null) {
+            $this->indexAdd($topic);
+        }
+
         $this->messages[$topic] = $packet;
+        $this->sizes[$topic] = $size;
         $this->totalBytes += $delta;
         $this->dirty = true;
 
@@ -53,10 +73,10 @@ final class RetainedMessageStore
 
     public function remove(string $topic): void
     {
-        $existing = $this->messages[$topic] ?? null;
-        if ($existing !== null) {
-            $this->totalBytes -= strlen($existing->payload);
-            unset($this->messages[$topic]);
+        if (isset($this->messages[$topic])) {
+            $this->totalBytes -= $this->sizes[$topic] ?? 0;
+            unset($this->messages[$topic], $this->sizes[$topic]);
+            self::indexRemove($this->index, explode('/', $topic), 0);
             $this->dirty = true;
         }
     }
@@ -88,26 +108,142 @@ final class RetainedMessageStore
     }
 
     /**
-     * @return PublishPacket[]
+     * What a retained message costs: its topic, its payload and its properties.
+     *
+     * Counting the payload alone left topic names (up to 64 KiB each) and property
+     * blocks (up to the packet size) free, so the byte limit bounded almost nothing.
+     */
+    private static function sizeOf(string $topic, PublishPacket $packet): int
+    {
+        $properties = $packet->properties === null ? 0 : strlen(PropertyCodec::encode($packet->properties));
+
+        return strlen($topic) + strlen($packet->payload) + $properties;
+    }
+
+    /**
+     * The message as it should be kept: only properties that travel with it.
+     */
+    private static function retainable(PublishPacket $packet): PublishPacket
+    {
+        if ($packet->properties === null) {
+            return $packet;
+        }
+
+        $forwardable = $packet->properties->forwardable();
+        if ($forwardable !== null && count($forwardable->getAll()) === count($packet->properties->getAll())) {
+            return $packet;
+        }
+
+        return new PublishPacket(
+            topicName: $packet->topicName,
+            payload: $packet->payload,
+            qos: $packet->qos,
+            dup: false,
+            retain: $packet->retain,
+            packetId: $packet->packetId,
+            protocolVersion: $packet->protocolVersion,
+            properties: $forwardable,
+        );
+    }
+
+    /**
+     * The retained messages a topic filter matches, by the rules of TopicFilter::matches.
+     *
+     * @return list<PublishPacket>
      */
     public function getMatching(string $topicFilter): array
     {
-        $results = [];
+        $topics = [];
+        self::collect($this->index, explode('/', TopicFilter::stripSharedPrefix($topicFilter)), 0, $topics);
 
-        foreach ($this->messages as $topic => $packet) {
-            if ($this->topicMatchesFilter($topic, $topicFilter)) {
-                $results[] = $packet;
+        return array_map(fn(string $topic): PublishPacket => $this->messages[$topic], $topics);
+    }
+
+    private function indexAdd(string $topic): void
+    {
+        $node = $this->index;
+        foreach (explode('/', $topic) as $level) {
+            $node = $node->children[$level] ??= new TopicNode();
+        }
+        $node->topic = $topic;
+    }
+
+    /**
+     * Clear a topic and prune the nodes it leaves empty.
+     *
+     * @param list<string> $levels
+     * @return bool Whether this node is now empty and may be dropped by its parent.
+     */
+    private static function indexRemove(TopicNode $node, array $levels, int $depth): bool
+    {
+        if ($depth === count($levels)) {
+            $node->topic = null;
+        } else {
+            $child = $node->children[$levels[$depth]] ?? null;
+            if ($child !== null && self::indexRemove($child, $levels, $depth + 1)) {
+                unset($node->children[$levels[$depth]]);
             }
         }
 
-        return $results;
+        return $node->isEmpty();
     }
 
-    private function topicMatchesFilter(string $topicName, string $topicFilter): bool
+    /**
+     * @param list<string> $levels Filter levels.
+     * @param list<string> $topics Collected topics.
+     * @param-out list<string> $topics
+     */
+    private static function collect(TopicNode $node, array $levels, int $depth, array &$topics): void
     {
-        // Matching lives in one place. This used to be a second, independently written
-        // implementation, so retained delivery and live routing could disagree about
-        // which subscribers a topic reaches.
-        return TopicFilter::matches($topicName, $topicFilter);
+        if ($depth === count($levels)) {
+            if ($node->topic !== null) {
+                $topics[] = $node->topic;
+            }
+            return;
+        }
+
+        $level = $levels[$depth];
+
+        if ($level === '#') {
+            // '#' also matches the parent level, so 'sport/#' matches 'sport'.
+            if ($node->topic !== null) {
+                $topics[] = $node->topic;
+            }
+            self::collectDescendants($node, $depth === 0, $topics);
+            return;
+        }
+
+        if ($level === '+') {
+            foreach ($node->children as $key => $child) {
+                // A wildcard at the first level does not match '$' topics (MQTT-4.7.2-1).
+                if ($depth === 0 && str_starts_with((string) $key, '$')) {
+                    continue;
+                }
+                self::collect($child, $levels, $depth + 1, $topics);
+            }
+            return;
+        }
+
+        $child = $node->children[$level] ?? null;
+        if ($child !== null) {
+            self::collect($child, $levels, $depth + 1, $topics);
+        }
+    }
+
+    /**
+     * @param list<string> $topics
+     * @param-out list<string> $topics
+     */
+    private static function collectDescendants(TopicNode $node, bool $skipDollar, array &$topics): void
+    {
+        foreach ($node->children as $key => $child) {
+            if ($skipDollar && str_starts_with((string) $key, '$')) {
+                continue;
+            }
+            if ($child->topic !== null) {
+                $topics[] = $child->topic;
+            }
+            self::collectDescendants($child, false, $topics);
+        }
     }
 }

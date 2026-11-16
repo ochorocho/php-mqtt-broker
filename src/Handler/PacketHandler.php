@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace PhpMqtt\Broker\Handler;
 
+use PhpMqtt\Broker\Auth\AuthFailureThrottle;
 use PhpMqtt\Broker\Auth\AuthenticatorInterface;
+use PhpMqtt\Broker\Auth\DeliveryAuthorizerInterface;
 use PhpMqtt\Broker\Configuration;
 use PhpMqtt\Broker\Connection\Connection;
 use PhpMqtt\Broker\Connection\ConnectionManager;
 use PhpMqtt\Broker\Exception\ProtocolViolationException;
+use PhpMqtt\Broker\Log\LogSanitizer;
 use PhpMqtt\Broker\Message\RetainedMessageStore;
 use PhpMqtt\Broker\Protocol\Packet\ConnackPacket;
 use PhpMqtt\Broker\Protocol\Packet\ConnectPacket;
@@ -34,6 +37,7 @@ use PhpMqtt\Broker\Protocol\ProtocolVersion;
 use PhpMqtt\Broker\Protocol\PubackReasonCode;
 use PhpMqtt\Broker\Protocol\SubackReasonCode;
 use PhpMqtt\Broker\Protocol\TopicFilter;
+use PhpMqtt\Broker\Server\PeerCertificateStream;
 use PhpMqtt\Broker\Session\SessionManager;
 use PhpMqtt\Broker\Subscription\SubscriptionManager;
 use PhpMqtt\Broker\Event\MessagePublished;
@@ -53,6 +57,8 @@ final class PacketHandler
     private readonly SessionManager $sessionManager;
 
     private readonly InFlightMessageTracker $inFlight;
+
+    private readonly AuthFailureThrottle $authThrottle;
 
     /** @var array<string, \React\EventLoop\TimerInterface> clientId => will delay timer */
     private array $willDelayTimers = [];
@@ -74,8 +80,22 @@ final class PacketHandler
             maxMessages: $this->config->maxRetainedMessages,
             maxBytes: $this->config->maxRetainedBytes,
         );
-        $this->sessionManager = new SessionManager(maxSessions: $this->config->maxSessions);
         $this->inFlight = new InFlightMessageTracker();
+        $this->sessionManager = new SessionManager(
+            maxSessions: $this->config->maxSessions,
+            // Subscriptions stay routed while a client is offline, so its messages can
+            // be queued. When the session itself ends they must go too, or they are
+            // kept forever and handed to the next connection with that client ID.
+            onRemoved: function (string $clientId): void {
+                $this->subscriptionManager->removeClient($clientId);
+                $this->inFlight->forget($clientId);
+            },
+            maxSessionsPerUsername: $this->config->maxSessionsPerUsername,
+        );
+        $this->authThrottle = new AuthFailureThrottle(
+            maxFailures: $this->config->maxAuthFailuresPerHost,
+            window: $this->config->authFailureWindow,
+        );
     }
 
     public function getRetainedMessages(): RetainedMessageStore
@@ -152,8 +172,8 @@ final class PacketHandler
                         $this->publishWillMessage($connection);
                     } catch (\Throwable $e) {
                         $this->logger->error('Delayed will publication failed for {clientId}: {error}', [
-                            'clientId' => $clientId,
-                            'error' => $e->getMessage(),
+                            'clientId' => LogSanitizer::forLog($clientId),
+                            'error' => LogSanitizer::forLog($e->getMessage(), 256),
                             'exception' => $e,
                         ]);
                     }
@@ -196,13 +216,22 @@ final class PacketHandler
             $session->disconnectedAt = microtime(true);
             $session->protocolVersion = $connection->getProtocolVersion();
 
-            // Save pending outgoing messages (QoS 1/2 not yet acknowledged)
-            // so they can be redelivered on reconnect
-            foreach ($this->inFlight->unacknowledged($clientId) as $pendingPacket) {
-                $this->queuePendingMessage($session, $pendingPacket);
+            // Messages sent and not yet acknowledged go back in front of the queue:
+            // they were sent before anything still waiting, and are redelivered first.
+            $unacknowledged = $this->inFlight->unacknowledged($clientId);
+            if ($unacknowledged !== []) {
+                $session->pendingMessages = array_merge($unacknowledged, $session->pendingMessages);
+                $overflow = count($session->pendingMessages) - $this->config->maxPendingMessagesPerSession;
+                if ($overflow > 0) {
+                    array_splice($session->pendingMessages, 0, $overflow);
+                    $this->logger->warning('Offline queue full for {clientId}, dropped {count} oldest message(s)', [
+                        'clientId' => LogSanitizer::forLog($clientId),
+                        'count' => $overflow,
+                    ]);
+                }
             }
 
-            $this->inFlight->forget($clientId);
+            $this->inFlight->suspend($clientId);
         }
     }
 
@@ -246,6 +275,44 @@ final class PacketHandler
             return;
         }
 
+        // Values MQTT 5.0 makes a Protocol Error, refused before anything is decided about
+        // the client. Ignoring them left client and broker disagreeing about the session.
+        $refusal = $version === ProtocolVersion::V50 && $packet->properties !== null
+            ? self::connectPropertyRefusal($packet->properties)
+            : null;
+        if ($refusal !== null) {
+            $this->logger->debug('CONNECT from {address} refused: {reason}', [
+                'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                'reason' => $refusal->name,
+            ]);
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $refusal->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
+        // A will is published like any message, so its topic has to be one a client could
+        // publish to: no wildcard, within the limits. It was never checked at all.
+        if ($packet->hasWill && $packet->willTopic !== null
+            && (!TopicFilter::isValidName($packet->willTopic) || $this->config->exceedsTopicLimits($packet->willTopic))
+        ) {
+            $this->logger->debug('CONNECT from {address} refused: will topic is not a valid topic name', [
+                'address' => LogSanitizer::address($connection->getRemoteAddress()),
+            ]);
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::TopicNameInvalid->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
         $clientId = $packet->clientId;
         if ($clientId === '') {
             if ($version === ProtocolVersion::V50) {
@@ -263,22 +330,72 @@ final class PacketHandler
                     return;
                 }
                 $clientId = 'auto-' . bin2hex(random_bytes(8));
+                $connection->setAssignedClientId(true);
             }
         }
 
+        // With mutual TLS the certificate already proves who the client is: its name is the
+        // username, and what CONNECT claims does not count.
+        $username = $packet->username;
+        if ($this->config->tlsIdentityAsUsername) {
+            $stream = $connection->getStream();
+            $username = $stream instanceof PeerCertificateStream ? $stream->getPeerCertificateCommonName() : null;
+
+            if ($username === null) {
+                $this->logger->warning('No certificate identity for client {clientId} from {address}, connection refused', [
+                    'clientId' => LogSanitizer::forLog($clientId),
+                    'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                ]);
+                $connection->send(new ConnackPacket(
+                    sessionPresent: false,
+                    returnCode: $version === ProtocolVersion::V50
+                        ? ConnectReasonCode::NotAuthorized->value
+                        : ConnectReasonCode::NotAuthorizedV311->value,
+                    protocolVersion: $version,
+                ));
+                $connection->close();
+                return;
+            }
+        }
+
+        // A host that keeps failing is answered without a password check: each check is
+        // a deliberately slow hash on the broker's only thread, so unthrottled guessing
+        // would stall every client, not just fail to get in.
+        $host = AuthFailureThrottle::hostOf($connection->getRemoteAddress());
+        if ($this->authThrottle->isThrottled($host)) {
+            // Not "Authentication failed": nothing was checked, and the fail2ban filter
+            // must not count the same attacker twice for one refusal.
+            $this->logger->warning('Login throttled for {address} after repeated failures (client {clientId})', [
+                'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                'clientId' => LogSanitizer::forLog($clientId),
+            ]);
+
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::ConnectionRateExceeded->value
+                    : ConnectReasonCode::NotAuthorizedV311->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
         if (!$this->authorize(
-            fn(): bool => $this->authenticator->authenticate($clientId, $packet->username, $packet->password),
+            fn(): bool => $this->authenticator->authenticate($clientId, $username, $packet->password),
             'authenticate',
             $clientId,
         )) {
+            $this->authThrottle->recordFailure($host);
+
             // The only record a rejected login leaves. Without it a guessing run is
             // invisible, and there is nothing for a log-based blocker to match on.
             $this->logger->warning(
                 'Authentication failed for {username} from {address} (client {clientId})',
                 [
-                    'username' => self::forLog($packet->username ?? '<none>'),
-                    'address' => self::addressForLog($connection->getRemoteAddress()),
-                    'clientId' => self::forLog($clientId),
+                    'username' => LogSanitizer::forLog($username ?? '<none>'),
+                    'address' => LogSanitizer::address($connection->getRemoteAddress()),
+                    'clientId' => LogSanitizer::forLog($clientId),
                 ],
             );
 
@@ -296,8 +413,9 @@ final class PacketHandler
         // Bind the client ID to the authenticated principal before any takeover.
         // Without this, valid credentials allow evicting another client and, for
         // persistent sessions, inheriting its subscriptions and queued messages.
-        if (!$this->authorize(
-            fn(): bool => $this->authenticator->canUseClientId($clientId, $packet->username),
+        // An ID the broker generated is random and belongs to no account.
+        if (!$connection->isAssignedClientId() && !$this->authorize(
+            fn(): bool => $this->authenticator->canUseClientId($clientId, $username),
             'canUseClientId',
             $clientId,
         )) {
@@ -308,9 +426,9 @@ final class PacketHandler
             $this->logger->warning(
                 'Client ID {clientId} not allowed for {username} from {address}',
                 [
-                    'clientId' => self::forLog($clientId),
-                    'username' => self::forLog($packet->username ?? '<none>'),
-                    'address' => self::addressForLog($connection->getRemoteAddress()),
+                    'clientId' => LogSanitizer::forLog($clientId),
+                    'username' => LogSanitizer::forLog($username ?? '<none>'),
+                    'address' => LogSanitizer::address($connection->getRemoteAddress()),
                 ],
             );
 
@@ -329,7 +447,7 @@ final class PacketHandler
         // it at CONNECT and silently dropping it at disconnect time.
         if ($packet->hasWill && $packet->willTopic !== null
             && !$this->authorize(
-                fn(): bool => $this->authenticator->canPublish($clientId, $packet->willTopic ?? ''),
+                fn(): bool => $this->authenticator->canPublish($clientId, $username, $packet->willTopic ?? ''),
                 'canPublish(will)',
                 $clientId,
                 $packet->willTopic,
@@ -342,8 +460,8 @@ final class PacketHandler
             $this->logger->warning(
                 'Will topic {topic} denied for {clientId} at connect, connection refused',
                 [
-                    'topic' => self::forLog($packet->willTopic ?? ''),
-                    'clientId' => self::forLog($clientId),
+                    'topic' => LogSanitizer::forLog($packet->willTopic ?? ''),
+                    'clientId' => LogSanitizer::forLog($clientId),
                 ],
             );
 
@@ -352,6 +470,27 @@ final class PacketHandler
                 returnCode: $version === ProtocolVersion::V50
                     ? ConnectReasonCode::NotAuthorized->value
                     : ConnectReasonCode::NotAuthorizedV311->value,
+                protocolVersion: $version,
+            ));
+            $connection->close();
+            return;
+        }
+
+        // Checked before any takeover, so a refusal costs nothing. An account whose every
+        // session is live has none to give up for a new one.
+        if ($this->sessionManager->isOverQuota($clientId, $username)) {
+            $this->logger->warning('Session quota of {limit} reached for {username}, client {clientId} refused', [
+                'limit' => $this->config->maxSessionsPerUsername,
+                'username' => LogSanitizer::forLog($username ?? ''),
+                'clientId' => LogSanitizer::forLog($clientId),
+            ]);
+            $connection->send(new ConnackPacket(
+                sessionPresent: false,
+                // 3.1.1 has no quota code; "server unavailable" at least invites a retry
+                // rather than suggesting the credentials are wrong.
+                returnCode: $version === ProtocolVersion::V50
+                    ? ConnectReasonCode::QuotaExceeded->value
+                    : ConnectReasonCode::ServerUnavailable->value,
                 protocolVersion: $version,
             ));
             $connection->close();
@@ -371,6 +510,7 @@ final class PacketHandler
         }
 
         $connection->setClientId($clientId);
+        $connection->setUsername($username);
         $connection->setConnected(true);
         $connection->setCleanSession($packet->cleanSession);
 
@@ -395,6 +535,13 @@ final class PacketHandler
                 $connection->setClientTopicAliasMaximum((int) $topicAliasMax);
             }
         }
+
+        // 3.1.1 has no Receive Maximum, and a 5.0 client may ask for 65535: either way
+        // the broker would hold that many unacknowledged messages for one client.
+        $connection->setReceiveMaximum(min($connection->getReceiveMaximum(), $this->config->maxInflightMessages));
+
+        // Authenticated now; the pre-CONNECT packet limit no longer applies.
+        $connection->getPacketStream()->setMaxPacketSize($this->config->maxPacketSize);
 
         $connection->clearTopicAliases();
 
@@ -443,7 +590,7 @@ final class PacketHandler
                 $session->subscriptions = array_values(array_filter(
                     $session->subscriptions,
                     fn($sub): bool => $this->authorize(
-                        fn(): bool => $this->authenticator->canSubscribe($clientId, $sub->topicFilter),
+                        fn(): bool => $this->authenticator->canSubscribe($clientId, $username, $sub->topicFilter),
                         'canSubscribe(restore)',
                         $clientId,
                         $sub->topicFilter,
@@ -451,11 +598,16 @@ final class PacketHandler
                 ));
                 $this->subscriptionManager->removeClient($clientId);
                 $this->subscriptionManager->restoreClientSubscriptions($clientId, $session->subscriptions);
+            } else {
+                // No session to resume, so nothing may be resumed: anything still routed
+                // under this client ID was granted to a session that no longer exists.
+                $this->subscriptionManager->removeClient($clientId);
+                $this->inFlight->forget($clientId);
             }
         }
 
         // Pre-create session with protocol version so offline message delivery uses correct format
-        $preSession = $this->sessionManager->getOrCreate($clientId);
+        $preSession = $this->sessionManager->claim($clientId, $username);
         $preSession->protocolVersion = $version;
 
         $connackProps = null;
@@ -485,7 +637,9 @@ final class PacketHandler
 
         if ($effectiveKeepAlive > 0) {
             $connection->startKeepAliveTimer(function (Connection $conn): void {
-                $this->logger->debug('Keep alive timeout for {client}', ['client' => $conn->getClientId()]);
+                $this->logger->debug('Keep alive timeout for {client}', [
+                    'client' => LogSanitizer::forLog($conn->getClientId() ?? ''),
+                ]);
                 $this->handleDisconnect($conn, false);
                 $conn->close();
             });
@@ -494,40 +648,51 @@ final class PacketHandler
         if ($sessionPresent) {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
-                foreach ($session->pendingMessages as $msg) {
-                    if ($version === ProtocolVersion::V50 && $msg->properties !== null) {
-                        $expiryInterval = $msg->properties->get(PropertyId::MessageExpiryInterval);
-                        if ($expiryInterval !== null && $session->disconnectedAt > 0.0) {
-                            $elapsed = (int) (microtime(true) - $session->disconnectedAt);
-                            $remaining = (int) $expiryInterval - $elapsed;
-                            if ($remaining <= 0) {
-                                continue; // Message expired, skip
-                            }
-                            $msg->properties->remove(PropertyId::MessageExpiryInterval);
-                            $msg->properties->set(PropertyId::MessageExpiryInterval, $remaining);
-                        }
-                    }
+                $session->pendingMessages = self::withoutExpired($session->pendingMessages, $session->disconnectedAt);
 
-                    $packetId = $msg->qos > 0
-                        ? ($msg->packetId ?? $this->inFlight->allocatePacketId($clientId))
-                        : null;
-                    $deliverMsg = new PublishPacket(
-                        topicName: $msg->topicName,
-                        payload: $msg->payload,
-                        qos: $msg->qos,
-                        dup: $msg->qos > 0,
-                        retain: $msg->retain,
-                        packetId: $packetId,
-                        protocolVersion: $connection->getProtocolVersion(),
-                        properties: $msg->properties,
-                    );
-                    $this->inFlight->sendTracked($connection, $deliverMsg, $clientId);
+                // QoS 2 deliveries the client confirmed with PUBREC before it left: resend
+                // the PUBREL it is owed (MQTT-4.4.0-1). Each holds a window slot until its
+                // PUBCOMP, as it did on the old connection.
+                foreach ($this->inFlight->pubcompPending($clientId) as $pendingId) {
+                    $connection->send(new PubrelPacket(packetId: $pendingId, protocolVersion: $version));
+                    $connection->incrementUnackedOutgoing();
                 }
-                $session->pendingMessages = [];
+
+                // Through the drain path, so the client's Receive Maximum applies to the
+                // replay too; the rest follows as acknowledgements free the window. Every
+                // queued message used to be written at once.
+                $this->drainPendingMessages($connection, redelivery: true);
             }
         }
 
-        $this->logger->info('Client connected: {clientId}', ['clientId' => $clientId]);
+        // Connected again: the session is no longer counting towards its expiry. Left in
+        // place, the old disconnect time let the reaper drop a live client's session.
+        $preSession->disconnectedAt = 0.0;
+
+        $this->logger->info('Client connected: {clientId}', ['clientId' => LogSanitizer::forLog($clientId)]);
+    }
+
+    /**
+     * Why a 5.0 CONNECT must be refused for its properties, or null when they are fine.
+     */
+    private static function connectPropertyRefusal(PropertyCollection $properties): ?ConnectReasonCode
+    {
+        // The broker implements no enhanced authentication. Letting such a client in
+        // would skip the exchange it asked for, and with it any proof it may rely on
+        // that this is the server it meant to reach.
+        if ($properties->get(PropertyId::AuthenticationMethod) !== null) {
+            return ConnectReasonCode::BadAuthenticationMethod;
+        }
+
+        if ($properties->get(PropertyId::AuthenticationData) !== null) {
+            return ConnectReasonCode::ProtocolError;
+        }
+
+        if ($properties->get(PropertyId::ReceiveMaximum) === 0 || $properties->get(PropertyId::MaximumPacketSize) === 0) {
+            return ConnectReasonCode::ProtocolError;
+        }
+
+        return null;
     }
 
     private function handlePublish(Connection $connection, PacketInterface $packet): void
@@ -537,6 +702,15 @@ final class PacketHandler
         }
         $clientId = $connection->getClientId();
         if ($clientId === null) {
+            return;
+        }
+
+        // Before anything keeps the topic - an alias registration, the retained store.
+        if ($packet->topicName !== '' && $this->config->exceedsTopicLimits($packet->topicName)) {
+            $this->logger->debug('Publish from {clientId} refused: topic exceeds the configured limits', [
+                'clientId' => LogSanitizer::forLog($clientId),
+            ]);
+            $this->acknowledgeRefusedPublish($connection, $packet, PubackReasonCode::TopicNameInvalid);
             return;
         }
 
@@ -606,7 +780,7 @@ final class PacketHandler
         // An empty retained payload deletes the retained message for a topic, so this
         // also gates retained-message destruction.
         if (!$this->authorize(
-            fn(): bool => $this->authenticator->canPublish($clientId, $packet->topicName),
+            fn(): bool => $this->authenticator->canPublish($clientId, $connection->getUsername(), $packet->topicName),
             'canPublish',
             $clientId,
             $packet->topicName,
@@ -623,8 +797,8 @@ final class PacketHandler
                 // broker that does not support them; the operator should know
                 // it is a limit instead.
                 $this->logger->warning('Retained message on {topic} from {clientId} dropped: retained limits reached', [
-                    'topic' => $packet->topicName,
-                    'clientId' => $clientId,
+                    'topic' => LogSanitizer::forLog($packet->topicName),
+                    'clientId' => LogSanitizer::forLog($clientId),
                 ]);
             }
         }
@@ -661,9 +835,10 @@ final class PacketHandler
             return;
         }
 
-        $this->inFlight->acknowledgeOutgoing($clientId, $packet->packetId);
-        $connection->decrementUnackedOutgoing();
-        $this->drainPendingMessages($connection);
+        if ($this->inFlight->acknowledgeOutgoing($clientId, $packet->packetId)) {
+            $connection->decrementUnackedOutgoing();
+            $this->drainPendingMessages($connection);
+        }
     }
 
     private function handlePubrec(Connection $connection, PacketInterface $packet): void
@@ -729,9 +904,10 @@ final class PacketHandler
             return;
         }
 
-        $this->inFlight->completeOutgoing($clientId, $packet->packetId);
-        $connection->decrementUnackedOutgoing();
-        $this->drainPendingMessages($connection);
+        if ($this->inFlight->completeOutgoing($clientId, $packet->packetId)) {
+            $connection->decrementUnackedOutgoing();
+            $this->drainPendingMessages($connection);
+        }
     }
 
     private function handleSubscribe(Connection $connection, PacketInterface $packet): void
@@ -766,7 +942,19 @@ final class PacketHandler
 
         $returnCodes = [];
 
-        foreach ($packet->subscriptions as $sub) {
+        /** @var array<string, true> $retainedSent filters whose retained messages went out in this packet */
+        $retainedSent = [];
+
+        foreach (array_values($packet->subscriptions) as $index => $sub) {
+            // A single SUBSCRIBE could name hundreds of thousands of filters, each one a
+            // retained-store lookup and a burst of output.
+            if ($index >= $this->config->maxFiltersPerSubscribe) {
+                $returnCodes[] = $version === ProtocolVersion::V50
+                    ? SubackReasonCode::QuotaExceeded->value
+                    : SubackReasonCode::UnspecifiedError->value;
+                continue;
+            }
+
             $topic = $sub['topic'];
             $qos = $sub['qos'];
             $noLocal = $sub['noLocal'] ?? false;
@@ -780,9 +968,15 @@ final class PacketHandler
                 continue;
             }
 
+            // A client cannot receive its own messages through a group it shares with
+            // others anyway; asking it to is a Protocol Error (MQTT-3.8.3-4).
+            if ($noLocal && TopicFilter::isShared($topic)) {
+                throw new ProtocolViolationException('No Local cannot be set on a shared subscription');
+            }
+
             // Bound trie growth: deep filters and unlimited subscriptions per client are
             // both cheap ways to allocate nodes that used to be kept for the process life.
-            if (substr_count($topic, '/') + 1 > $this->config->maxTopicLevels) {
+            if ($this->config->exceedsTopicLimits($topic)) {
                 $returnCodes[] = SubackReasonCode::UnspecifiedError->value;
                 continue;
             }
@@ -796,7 +990,7 @@ final class PacketHandler
             }
 
             if (!$this->authorize(
-                fn(): bool => $this->authenticator->canSubscribe($clientId, $topic),
+                fn(): bool => $this->authenticator->canSubscribe($clientId, $connection->getUsername(), $topic),
                 'canSubscribe',
                 $clientId,
                 $topic,
@@ -818,7 +1012,16 @@ final class PacketHandler
             );
             $returnCodes[] = $qos; // Granted QoS
 
-            if ($this->shouldSendRetained($version, $retainHandling, $existingSubscription)) {
+            // Naming one filter repeatedly re-sent every retained message per
+            // repetition. Once per filter per packet is what any client can use.
+            // A shared subscription receives no retained messages (4.8.2): sent to whichever
+            // member happened to subscribe, they would be neither shared nor useful.
+            if (!isset($retainedSent[$topic])
+                && !TopicFilter::isShared($topic)
+                && !$connection->isClosed()
+                && $this->shouldSendRetained($version, $retainHandling, $existingSubscription)
+            ) {
+                $retainedSent[$topic] = true;
                 $this->deliverRetainedMessages(
                     $connection,
                     $clientId,
@@ -870,6 +1073,11 @@ final class PacketHandler
         $version = $connection->getProtocolVersion();
 
         foreach ($this->retainedMessages->getMatching($topicFilter) as $retainedPacket) {
+            // Closed mid-delivery, e.g. for not reading: the rest would go nowhere.
+            if ($connection->isClosed()) {
+                return;
+            }
+
             $qos = min($retainedPacket->qos, $subscribedQoS);
 
             $properties = null;
@@ -905,15 +1113,13 @@ final class PacketHandler
                 continue;
             }
 
-            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
+            $this->sendPublish($connection, $deliverPacket, $clientId);
         }
     }
 
     /**
      * A 5.0 client may declare a maximum packet size it will accept (MQTT-3.1.2-24).
-     *
-     * Only for retained delivery, where the connection is live and its version is the
-     * one to trust. deliverToClient has its own check for a reason; see there.
+     * Checked on the form actually sent, against the live connection.
      */
     private function exceedsClientPacketSize(Connection $connection, PublishPacket $packet): bool
     {
@@ -982,6 +1188,12 @@ final class PacketHandler
         if ($connection->getProtocolVersion() === ProtocolVersion::V50 && $packet->properties !== null) {
             $newSEI = $packet->properties->get(PropertyId::SessionExpiryInterval);
             if ($newSEI !== null) {
+                // A session the CONNECT declined cannot be created on the way out.
+                if ((int) $newSEI > 0 && $connection->getSessionExpiryInterval() === 0) {
+                    throw new ProtocolViolationException(
+                        'DISCONNECT cannot set a Session Expiry Interval when CONNECT set none',
+                    );
+                }
                 $connection->setSessionExpiryInterval((int) $newSEI);
             }
         }
@@ -1012,40 +1224,12 @@ final class PacketHandler
         if (count($session->pendingMessages) >= $limit) {
             array_shift($session->pendingMessages);
             $this->logger->warning('Offline queue full for {clientId}, dropped oldest message', [
-                'clientId' => $session->clientId,
+                'clientId' => LogSanitizer::forLog($session->clientId),
                 'limit' => $limit,
             ]);
         }
 
         $session->pendingMessages[] = $packet;
-    }
-
-    /**
-     * Make an attacker-controlled string safe to interpolate into a log line.
-     *
-     * Usernames and client IDs come off the wire, and the UTF-8 validation they pass
-     * through rejects NUL and surrogates but not newlines — so an unescaped one could
-     * forge whole log entries and poison anything parsing them.
-     */
-    private static function forLog(string $value): string
-    {
-        $escaped = addcslashes($value, "\0..\37\\\177");
-
-        return mb_strlen($escaped) > 128 ? mb_substr($escaped, 0, 128) . '…' : $escaped;
-    }
-
-    /**
-     * The peer address without the transport scheme.
-     *
-     * The stream reports `tcp://host:port` (or `tls://…`), but a log line is read by
-     * fail2ban and friends as well as by people, and a scheme that varies with the
-     * listener only complicates the pattern they have to match.
-     */
-    private static function addressForLog(string $remoteAddress): string
-    {
-        $withoutScheme = preg_replace('#^[a-z0-9.+-]+://#i', '', $remoteAddress) ?? $remoteAddress;
-
-        return self::forLog($withoutScheme);
     }
 
     /**
@@ -1064,9 +1248,9 @@ final class PacketHandler
         } catch (\Throwable $e) {
             $this->logger->error('Authenticator failed during {action} for {clientId}, denying: {error}', [
                 'action' => $action,
-                'clientId' => $clientId,
-                'topic' => $topic,
-                'error' => $e->getMessage(),
+                'clientId' => LogSanitizer::forLog($clientId),
+                'topic' => LogSanitizer::forLog($topic),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
                 'exception' => $e,
             ]);
 
@@ -1082,19 +1266,28 @@ final class PacketHandler
      */
     private function rejectPublish(Connection $connection, PublishPacket $packet): void
     {
-        $version = $connection->getProtocolVersion();
-        $isV5 = $version === ProtocolVersion::V50;
-
         $this->logger->warning('Publish denied for {clientId} on {topic}', [
-            'clientId' => $connection->getClientId(),
-            'topic' => $packet->topicName,
+            'clientId' => LogSanitizer::forLog($connection->getClientId() ?? ''),
+            'topic' => LogSanitizer::forLog($packet->topicName),
         ]);
+
+        $this->acknowledgeRefusedPublish($connection, $packet, PubackReasonCode::NotAuthorized);
+    }
+
+    /**
+     * Answer a PUBLISH that will not be routed. 5.0 can say why; 3.1.1 cannot signal a
+     * refusal at all, so the packet is acknowledged normally and dropped.
+     */
+    private function acknowledgeRefusedPublish(Connection $connection, PublishPacket $packet, PubackReasonCode $reason): void
+    {
+        $version = $connection->getProtocolVersion();
+        $reasonCode = $version === ProtocolVersion::V50 ? $reason->value : PubackReasonCode::Success->value;
 
         if ($packet->qos === 1 && $packet->packetId !== null) {
             $connection->send(new PubackPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
+                reasonCode: $reasonCode,
             ));
         }
 
@@ -1102,7 +1295,7 @@ final class PacketHandler
             $connection->send(new PubrecPacket(
                 packetId: $packet->packetId,
                 protocolVersion: $version,
-                reasonCode: $isV5 ? PubackReasonCode::NotAuthorized->value : PubackReasonCode::Success->value,
+                reasonCode: $reasonCode,
             ));
         }
     }
@@ -1120,14 +1313,14 @@ final class PacketHandler
         // connection was open, or between a delayed will being armed and firing.
         $clientId = $connection->getClientId();
         if ($clientId !== null && !$this->authorize(
-            fn(): bool => $this->authenticator->canPublish($clientId, $willTopic),
+            fn(): bool => $this->authenticator->canPublish($clientId, $connection->getUsername(), $willTopic),
             'canPublish(will)',
             $clientId,
             $willTopic,
         )) {
             $this->logger->warning('Will message denied for {clientId} on {topic}', [
-                'clientId' => $clientId,
-                'topic' => $willTopic,
+                'clientId' => LogSanitizer::forLog($clientId),
+                'topic' => LogSanitizer::forLog($willTopic),
             ]);
             return;
         }
@@ -1212,7 +1405,7 @@ final class PacketHandler
         }
 
         foreach ($perClient as $info) {
-            $this->deliverToClient(
+            $this->deliverIsolated(
                 $info['clientId'],
                 $packet,
                 $info['qos'],
@@ -1252,13 +1445,47 @@ final class PacketHandler
             $effectiveQoS = min($packet->qos, $selectedSub->qos);
             $subIds = $selectedSub->subscriptionIdentifier > 0 ? [$selectedSub->subscriptionIdentifier] : [];
 
-            $this->deliverToClient(
+            $this->deliverIsolated(
                 $selectedSub->clientId,
                 $packet,
                 $effectiveQoS,
                 $subIds,
                 $selectedSub->retainAsPublished,
             );
+        }
+    }
+
+    /**
+     * Deliver to one subscriber without letting its failure become anyone else's.
+     *
+     * Routing runs inside the publisher's packet handling. An exception for one
+     * subscriber - a broken socket, a message it cannot be sent - used to escape there:
+     * routing stopped for every subscriber after it, and the publisher, who did nothing
+     * wrong, was disconnected. The failure is now contained to the subscriber it belongs to.
+     *
+     * @param list<int> $subscriptionIds
+     */
+    private function deliverIsolated(
+        string $clientId,
+        PublishPacket $originalPacket,
+        int $qos,
+        array $subscriptionIds = [],
+        bool $retainAsPublished = false,
+    ): void {
+        try {
+            $this->deliverToClient($clientId, $originalPacket, $qos, $subscriptionIds, $retainAsPublished);
+        } catch (\Throwable $e) {
+            $this->logger->error('Delivery to {clientId} failed, closing its connection: {error}', [
+                'clientId' => LogSanitizer::forLog($clientId),
+                'error' => LogSanitizer::forLog($e->getMessage(), 256),
+                'exception' => $e,
+            ]);
+
+            try {
+                $this->connectionManager->getByClientId($clientId)?->close();
+            } catch (\Throwable) {
+                // Already failing; the close was the last thing worth trying.
+            }
         }
     }
 
@@ -1280,20 +1507,6 @@ final class PacketHandler
             $version = $session !== null ? $session->protocolVersion : ProtocolVersion::V311;
         }
 
-        $packetId = $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null;
-
-        $topicName = $originalPacket->topicName;
-        $aliasInfo = null;
-        if ($version === ProtocolVersion::V50 && $connection !== null) {
-            $aliasInfo = $connection->getOrCreateOutgoingTopicAlias($originalPacket->topicName);
-
-            // A new alias must carry the full topic name so the client can record it;
-            // an established one is sent as the alias alone.
-            if ($aliasInfo !== null && !$aliasInfo['isNew']) {
-                $topicName = '';
-            }
-        }
-
         $properties = null;
         if ($version === ProtocolVersion::V50) {
             $properties = new PropertyCollection();
@@ -1302,48 +1515,31 @@ final class PacketHandler
                 $this->forwardProperties($originalPacket->properties, $properties);
             }
 
-            if ($aliasInfo !== null) {
-                $properties->set(PropertyId::TopicAlias, $aliasInfo['alias']);
-            }
-
             foreach ($subscriptionIds as $subId) {
                 $properties->set(PropertyId::SubscriptionIdentifier, $subId);
             }
         }
 
-        $retainFlag = $retainAsPublished ? $originalPacket->retain : false;
-
+        // Built with the topic name, never an alias: this is also the form kept when the
+        // message has to wait, possibly for a later connection. sendPublish() applies an
+        // alias on the way out.
         $deliverPacket = new PublishPacket(
-            topicName: $topicName,
+            topicName: $originalPacket->topicName,
             payload: $originalPacket->payload,
             qos: $qos,
-            retain: $retainFlag,
-            packetId: $packetId,
+            retain: $retainAsPublished ? $originalPacket->retain : false,
+            packetId: $qos > 0 ? $this->inFlight->allocatePacketId($clientId) : null,
             protocolVersion: $version,
             properties: $properties,
         );
 
-        // Deliberately not exceedsClientPacketSize(): this path keys on $version, which
-        // for an offline client comes from the saved session rather than the connection.
-        // The two look like the same check and are not.
-        if ($version === ProtocolVersion::V50 && $connection !== null && $connection->getClientMaximumPacketSize() > 0) {
-            $encoded = $this->packetEncoder->encode($deliverPacket);
-            if (strlen($encoded) > $connection->getClientMaximumPacketSize()) {
-                return; // Silently drop — must not send packets exceeding client's max
-            }
-        }
-
         if ($connection !== null && $connection->isConnected()) {
             if ($qos > 0 && $connection->getUnackedOutgoing() >= $connection->getReceiveMaximum()) {
-                $session = $this->sessionManager->get($clientId);
-                if ($session === null) {
-                    $session = $this->sessionManager->getOrCreate($clientId);
-                }
-                $this->queuePendingMessage($session, $deliverPacket);
+                $this->queuePendingMessage($this->sessionManager->getOrCreate($clientId), $deliverPacket);
                 return;
             }
 
-            $this->inFlight->sendTracked($connection, $deliverPacket, $clientId);
+            $this->sendPublish($connection, $deliverPacket, $clientId);
         } else {
             $session = $this->sessionManager->get($clientId);
             if ($session !== null) {
@@ -1353,9 +1549,132 @@ final class PacketHandler
     }
 
     /**
-     * Drain queued messages when flow control window opens.
+     * Send a PUBLISH in the form this connection needs.
+     *
+     * Two things belong to the connection rather than the message: its protocol version
+     * and its topic aliases. A message kept for later - queued past the window, or
+     * unacknowledged when the client left - may go out on another connection, so it is
+     * stored without them and they are applied here, to the copy on the wire. Stored
+     * with an alias, it was replayed as an alias the new connection had never set.
      */
-    private function drainPendingMessages(Connection $connection): void
+    private function sendPublish(Connection $connection, PublishPacket $packet, string $clientId): void
+    {
+        // Every PUBLISH to a live connection passes here - live, retained, queued and
+        // replayed alike - so this is the one place a per-delivery veto has to sit.
+        $authorizer = $this->authenticator;
+        if ($authorizer instanceof DeliveryAuthorizerInterface && !$this->authorize(
+            fn(): bool => $authorizer->canReceive($clientId, $connection->getUsername(), $packet->topicName),
+            'canReceive',
+            $clientId,
+            $packet->topicName,
+        )) {
+            return;
+        }
+
+        $version = $connection->getProtocolVersion();
+        if ($packet->protocolVersion !== $version) {
+            $packet = new PublishPacket(
+                topicName: $packet->topicName,
+                payload: $packet->payload,
+                qos: $packet->qos,
+                dup: $packet->dup,
+                retain: $packet->retain,
+                packetId: $packet->packetId,
+                protocolVersion: $version,
+                properties: $packet->properties,
+            );
+        }
+
+        $wire = $packet;
+        $commitAlias = false;
+        $alias = $version === ProtocolVersion::V50 ? $connection->outgoingTopicAlias($packet->topicName) : null;
+        if ($alias !== null) {
+            $properties = $packet->properties?->copy() ?? new PropertyCollection();
+            $properties->set(PropertyId::TopicAlias, $alias['alias']);
+
+            $aliased = new PublishPacket(
+                // A new alias carries the topic name so the client can record it; an
+                // established one is sent as the alias alone.
+                topicName: $alias['isNew'] ? $packet->topicName : '',
+                payload: $packet->payload,
+                qos: $packet->qos,
+                dup: $packet->dup,
+                retain: $packet->retain,
+                packetId: $packet->packetId,
+                protocolVersion: $version,
+                properties: $properties,
+            );
+
+            if (!$this->exceedsClientPacketSize($connection, $aliased)) {
+                $wire = $aliased;
+                $commitAlias = $alias['isNew'];
+            }
+        }
+
+        if ($this->exceedsClientPacketSize($connection, $wire)) {
+            return; // Must not send a packet larger than the client accepts; drop it.
+        }
+
+        // Only now: an alias assigned to a packet that is then dropped would be one the
+        // client never learns, and every later message on that topic would name it.
+        if ($commitAlias) {
+            $connection->getOrCreateOutgoingTopicAlias($packet->topicName);
+        }
+
+        $this->inFlight->sendTracked($connection, $wire, $clientId, $packet);
+    }
+
+    /**
+     * Queued messages whose Message Expiry Interval has not run out while the client was
+     * away, each with the interval reduced by the time it waited (MQTT-3.3.2-6).
+     *
+     * @param PublishPacket[] $messages
+     * @return list<PublishPacket>
+     */
+    private static function withoutExpired(array $messages, float $disconnectedAt): array
+    {
+        $elapsed = $disconnectedAt > 0.0 ? (int) (microtime(true) - $disconnectedAt) : 0;
+        $kept = [];
+
+        foreach ($messages as $message) {
+            $interval = $message->properties?->get(PropertyId::MessageExpiryInterval);
+            if ($message->properties === null || $interval === null || $elapsed === 0) {
+                $kept[] = $message;
+                continue;
+            }
+
+            $remaining = (int) $interval - $elapsed;
+            if ($remaining <= 0) {
+                continue;
+            }
+
+            $properties = $message->properties->copy();
+            $properties->remove(PropertyId::MessageExpiryInterval);
+            $properties->set(PropertyId::MessageExpiryInterval, $remaining);
+
+            $kept[] = new PublishPacket(
+                topicName: $message->topicName,
+                payload: $message->payload,
+                qos: $message->qos,
+                dup: $message->dup,
+                retain: $message->retain,
+                packetId: $message->packetId,
+                protocolVersion: $message->protocolVersion,
+                properties: $properties,
+            );
+        }
+
+        return $kept;
+    }
+
+    /**
+     * Send queued messages while the client's flow-control window has room.
+     *
+     * @param bool $redelivery The client has just reconnected: QoS 1/2 messages keep
+     *                         their packet id where it is still free (MQTT-4.4.0-1) and
+     *                         are marked DUP. Otherwise each gets a fresh id.
+     */
+    private function drainPendingMessages(Connection $connection, bool $redelivery = false): void
     {
         $clientId = $connection->getClientId();
         if ($clientId === null) {
@@ -1367,22 +1686,26 @@ final class PacketHandler
             return;
         }
 
-        while ($session->pendingMessages !== [] && ($connection->getUnackedOutgoing() < $connection->getReceiveMaximum())) {
+        while ($session->pendingMessages !== []
+            && !$connection->isClosed()
+            && $connection->getUnackedOutgoing() < $connection->getReceiveMaximum()
+        ) {
             $msg = array_shift($session->pendingMessages);
             if ($msg->qos > 0) {
-                $packetId = $this->inFlight->allocatePacketId($clientId);
                 $msg = new PublishPacket(
                     topicName: $msg->topicName,
                     payload: $msg->payload,
                     qos: $msg->qos,
-                    dup: false,
+                    dup: $redelivery,
                     retain: $msg->retain,
-                    packetId: $packetId,
+                    packetId: $redelivery
+                        ? $this->inFlight->claimPacketId($clientId, $msg->packetId)
+                        : $this->inFlight->allocatePacketId($clientId),
                     protocolVersion: $msg->protocolVersion,
                     properties: $msg->properties,
                 );
             }
-            $this->inFlight->sendTracked($connection, $msg, $clientId);
+            $this->sendPublish($connection, $msg, $clientId);
         }
     }
 
@@ -1415,16 +1738,11 @@ final class PacketHandler
      */
     private function forwardProperties(PropertyCollection $source, PropertyCollection $dest): void
     {
-        $forwardIds = [
-            PropertyId::PayloadFormatIndicator,
-            PropertyId::ContentType,
-            PropertyId::ResponseTopic,
-            PropertyId::CorrelationData,
-            PropertyId::UserProperty,
-            PropertyId::MessageExpiryInterval,
-        ];
+        foreach (PropertyId::cases() as $propId) {
+            if (!$propId->isForwardedWithMessage()) {
+                continue;
+            }
 
-        foreach ($forwardIds as $propId) {
             $val = $source->get($propId);
             if ($val !== null) {
                 if ($propId->isMultiValue() && is_array($val)) {

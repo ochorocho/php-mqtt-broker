@@ -40,4 +40,28 @@ final class PropertyCollection
     {
         return $this->properties === [];
     }
+
+    public function copy(): self
+    {
+        $copy = new self();
+        $copy->properties = $this->properties;
+
+        return $copy;
+    }
+
+    /**
+     * A copy holding only the properties that travel with an application message, or
+     * null when none are left.
+     */
+    public function forwardable(): ?self
+    {
+        $copy = new self();
+        foreach ($this->properties as $id => $value) {
+            if (PropertyId::from($id)->isForwardedWithMessage()) {
+                $copy->properties[$id] = $value;
+            }
+        }
+
+        return $copy->isEmpty() ? null : $copy;
+    }
 }
